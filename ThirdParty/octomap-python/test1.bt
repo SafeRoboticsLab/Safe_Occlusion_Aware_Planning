@@ -1,0 +1,7 @@
+# Octomap OcTree binary file
+# (feel free to add / change comments, but leave the first line as it is!)
+#
+id OcTree
+size 0
+res 0.1
+data

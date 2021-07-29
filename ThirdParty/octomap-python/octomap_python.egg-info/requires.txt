@@ -1,0 +1,7 @@
+numpy
+
+[example]
+glooey
+imgviz>=1.2.0
+pyglet
+trimesh[easy]
