@@ -74,10 +74,15 @@ class CameraBase(SensorBase):
         cv2.namedWindow(self.vis_name, cv2.WINDOW_NORMAL)
         
     
-    def update_visualizer(self):
+    def update_visualizer(self, folder = None, id = None):
         if self.vis_name is not None and (self.image is not None):
             screen = self.vis_name#cv2.cvtColor(self.vis_name, cv2.COLOR_RGB2BGR)
             cv2.imshow(screen, self.image)
+            
+
+            if folder is not None:
+                filename = folder+self.vis_name+"_%04d" % id+".jpeg"
+                cv2.imwrite(filename, self.image)
             cv2.waitKey(1)
     
     def set_intrinsic(self,K):
@@ -255,7 +260,7 @@ if __name__ == "__main__":
         vehicle.set_autopilot(True)
 
         depth = DepthCamera(world, blueprint_library, vehicle, fps=10)
-        semantic = SemanticCamera(world, blueprint_library, vehicle)
+        semantic = Camera(world, blueprint_library, vehicle)
 
         depth.setup_visualizer("Depth")
         semantic.setup_visualizer("Semantic")

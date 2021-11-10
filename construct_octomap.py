@@ -27,7 +27,8 @@ if __name__ == "__main__":
 
     save_folder = "data/map/"
     pointcloud_folder = "data/depth/"
-    filename = "Town01_intersection2"
+    #filename = "Town01_intersection2"
+    filename = 'Town05_blind_summit'
     infile = open(pointcloud_folder+filename+'.pkl','rb')
     pc_list = pickle.load(infile)
     infile.close()
@@ -38,7 +39,7 @@ if __name__ == "__main__":
 
     dt0 = datetime.now()
     for (pc, pose) in pc_list:
-        occupancy_map.insert_point_cloud(pc, pose, range=50)
+        occupancy_map.insert_point_cloud(pc, pose, range=500)
         process_time = datetime.now() - dt0
         sys.stdout.write('\r FPS: ' + str(1.0 / process_time.total_seconds()))
         sys.stdout.flush()

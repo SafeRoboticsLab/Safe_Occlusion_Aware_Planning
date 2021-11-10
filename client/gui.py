@@ -7,6 +7,7 @@ import datetime
 import os
 import carla
 import math
+import numpy as np
 
 def get_actor_display_name(actor, truncate=250):
     name = ' '.join(actor.type_id.replace('_', '.').title().split('.')[1:])
@@ -30,6 +31,10 @@ class Frame():
     def update_frame():
         pygame.display.flip()
 
+    def save_frame(self, folder, id):
+        filename = folder+'pygame_%04d.jpeg' % id
+        pygame.image.save(self.display, filename)
+
 
         
 
@@ -51,7 +56,7 @@ class HUD(object):
         default_font = 'ubuntumono'
         mono = default_font if default_font in fonts else fonts[0]
         mono = pygame.font.match_font(mono)
-        self._font_mono = pygame.font.Font(mono, 12 if os.name == 'nt' else 14)
+        self._font_mono = pygame.font.Font(mono, 16 if os.name == 'nt' else 18)
         self._notifications = FadingText(font, (width, 40), (0, height - 40))
         #self.help = HelpText(pygame.font.Font(mono, 16), width, height)
         self.server_fps = 0
@@ -75,8 +80,13 @@ class HUD(object):
         v = world.ego.get_velocity()
         if game is None:
             speed = math.sqrt(v.x**2 + v.y**2 + v.z**2)
+            progress = 0
+            runtime = self.simulation_time
         else:
             speed = game.v_cur
+            progress = game.p_cur
+            runtime = game.t_cur
+       
         c = world.ego.get_control()
         compass = world.imu_sensor.compass
         heading = 'N' if compass > 270.5 or compass < 89.5 else ''
@@ -93,47 +103,63 @@ class HUD(object):
             #'Server:  % 16.0f FPS' % self.server_fps,
             #'Client:  % 16.0f FPS' % clock.get_fps(),
             #'',
-            'Vehicle: % 20s' % get_actor_display_name(world.ego, truncate=20),
+            #'Vehicle: % 20s' % get_actor_display_name(world.ego, truncate=20),
             'Map:     % 20s' % world.map.name,
-            'Simulation time: % 12s' % datetime.timedelta(seconds=int(self.simulation_time)),
+            'Simulation time: % 10.2fs' % runtime,
             '',
-            'Speed:   % 15.0f km/h' % (3.6 * speed),
-            u'Compass:% 17.0f\N{DEGREE SIGN} % 2s' % (compass, heading),
-            'Accelero: (%5.1f,%5.1f,%5.1f)' % (world.imu_sensor.accelerometer),
-            'Gyroscop: (%5.1f,%5.1f,%5.1f)' % (world.imu_sensor.gyroscope),
+            'Speed:   % 16.2f m/s' % (speed),
+            'Progress: % 17.2f m' % (progress),
+            #u'Compass:% 17.0f\N{DEGREE SIGN} % 2s' % (compass, heading),
+            #'Accelero: (%5.1f,%5.1f,%5.1f)' % (world.imu_sensor.accelerometer),
+            #'Gyroscop: (%5.1f,%5.1f,%5.1f)' % (world.imu_sensor.gyroscope),
             'Location:% 20s' % ('(% 5.1f, % 5.1f)' % (t.location.x, t.location.y)),
-            'GNSS:% 24s' % ('(% 2.6f, % 3.6f)' % (world.gnss_sensor.lat, world.gnss_sensor.lon)),
+            #'GNSS:% 24s' % ('(% 2.6f, % 3.6f)' % (world.gnss_sensor.lat, world.gnss_sensor.lon)),
             'Height:  % 18.0f m' % t.location.z,
             '']
-        if isinstance(c, carla.VehicleControl):
-            self._info_text += [
-                ('Throttle:', c.throttle, 0.0, 1.0),
-                ('Steer:', c.steer, -1.0, 1.0),
-                ('Brake:', c.brake, 0.0, 1.0),
-                ('Reverse:', c.reverse),
-                ('Hand brake:', c.hand_brake),
-                ('Manual:', c.manual_gear_shift),
-                'Gear:        %s' % {-1: 'R', 0: 'N'}.get(c.gear, c.gear)]
-        elif isinstance(c, carla.WalkerControl):
-            self._info_text += [
-                ('Speed:', c.speed, 0.0, 5.556),
-                ('Jump:', c.jump)]
-        self._info_text += [
-            '',
-            'Collision:',
-            collision,
-            '',
-            'Number of vehicles: % 8d' % len(vehicles)]
-        if len(vehicles) > 1:
-            self._info_text += ['Nearby vehicles:']
-            distance = lambda l: math.sqrt((l.x - t.location.x)**2 + (l.y - t.location.y)**2 + (l.z - t.location.z)**2)
-            vehicles = [(distance(x.get_location()), x) for x in vehicles if x.id != world.ego.id]
-            for d, vehicle in sorted(vehicles, key=lambda vehicles: vehicles[0]):
-                if d > 200.0:
-                    break
-                vehicle_type = get_actor_display_name(vehicle, truncate=22)
-                self._info_text.append('% 4dm %s' % (d, vehicle_type))
+        # if isinstance(c, carla.VehicleControl):
+        #     self._info_text += [
+        #         ('Throttle:', c.throttle, 0.0, 1.0),
+        #         ('Steer:', c.steer, -1.0, 1.0),
+        #         ('Brake:', c.brake, 0.0, 1.0),
+        #         ('Reverse:', c.reverse),
+        #         ('Hand brake:', c.hand_brake),
+        #         ('Manual:', c.manual_gear_shift),
+        #         'Gear:        %s' % {-1: 'R', 0: 'N'}.get(c.gear, c.gear)]
+        # elif isinstance(c, carla.WalkerControl):
+        #     self._info_text += [
+        #         ('Speed:', c.speed, 0.0, 5.556),
+        #         ('Jump:', c.jump)]
+        # self._info_text += [
+        #     '',
+        #     'Collision:',
+        #     collision,
+        #     '',
+        #     'Number of vehicles: % 8d' % len(vehicles)]
+        # if len(vehicles) > 1:
+        #     self._info_text += ['Nearby vehicles:']
+        #     distance = lambda l: math.sqrt((l.x - t.location.x)**2 + (l.y - t.location.y)**2 + (l.z - t.location.z)**2)
+        #     vehicles = [(distance(x.get_location()), x) for x in vehicles if x.id != world.ego.id]
+        #     for d, vehicle in sorted(vehicles, key=lambda vehicles: vehicles[0]):
+        #         if d > 200.0:
+        #             break
+        #         vehicle_type = get_actor_display_name(vehicle, truncate=22)
+        #         self._info_text.append('% 4dm %s' % (d, vehicle_type))
 
+    def tick_record(self, frame):
+        #self._notifications.tick(world, clock)
+
+        velocity = frame.progress[2]
+                
+        self._info_text = [
+            'Simulation time: % 10.2fs' % frame.t,
+            '',
+            'Speed:   % 16.2f m/s' % (velocity),
+            'Progress: % 17.2f m' % (frame.progress[0]),
+            'Lateral Pos: %14.2f m' % (frame.progress[1]),
+            'Location:% 20s' % ('(% 5.1f, % 5.1f)' % (frame.ego.location[0], frame.ego.location[1])),
+            'Height:  % 18.0f m' % frame.ego.location[2],
+            '']
+       
     def toggle_info(self):
         self._show_info = not self._show_info
 

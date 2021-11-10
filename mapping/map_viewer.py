@@ -754,6 +754,9 @@ class  MapViewer(object):
         self.shadow_surface = pygame.Surface((self.map_image.surface.get_width(), self.map_image.surface.get_height()))
         self.shadow_surface.set_colorkey(COLOR_BLACK)
 
+        self.dangerzone_surface = pygame.Surface((self.map_image.surface.get_width(), self.map_image.surface.get_height()))
+        self.dangerzone_surface.set_colorkey(COLOR_BLACK)
+
         self.border_round_surface = pygame.Surface(self.dims, pygame.SRCALPHA).convert()
         self.border_round_surface.set_colorkey(COLOR_WHITE)
         self.border_round_surface.fill(COLOR_BLACK)
@@ -922,13 +925,34 @@ class  MapViewer(object):
             points_pixel = [world_to_pixel(p) for p in points]
             pygame.draw.polygon(self.shadow_surface, COLOR_YELLOW_0, points_pixel, width=0)
 
+    def _render_dangerzone(self, dangerzone_list, world_to_pixel):
+        if dangerzone_list is None:
+            return
+        self.dangerzone_surface.fill(COLOR_BLACK)
+
+        self.dangerzone_surface.set_alpha(100)
+        for dangerzone in dangerzone_list:
+            for right, left in dangerzone.coverage_list:
+                left_v = np.flip(left[:,:2], axis=0)
+                right_v = right[:,:2]
+
+                if right_v.shape[0] <=2 :
+                    continue
+                points = np.vstack((left_v, right_v)).tolist()
+                points_pixel = [world_to_pixel(p) for p in points]
+                if dangerzone.enforce:
+                    pygame.draw.polygon(self.dangerzone_surface, COLOR_SCARLET_RED_0, points_pixel, width=0)
+                else:
+                    pygame.draw.polygon(self.dangerzone_surface, COLOR_SKY_BLUE_0, points_pixel, width=0)
+
+
 
     def _render_actors(self, surface, vehicles, traffic_lights, speed_limits, walkers):
         """Renders all the actors"""
         # Static actors
-        self._render_traffic_lights(surface, [tl[0] for tl in traffic_lights], self.map_image.world_to_pixel)
-        self._render_speed_limits(surface, [sl[0] for sl in speed_limits], self.map_image.world_to_pixel,
-                                  self.map_image.world_to_pixel_width)
+        # self._render_traffic_lights(surface, [tl[0] for tl in traffic_lights], self.map_image.world_to_pixel)
+        # self._render_speed_limits(surface, [sl[0] for sl in speed_limits], self.map_image.world_to_pixel,
+        #                           self.map_image.world_to_pixel_width)
 
         # Dynamic actors
         self._render_vehicles(surface, vehicles, self.map_image.world_to_pixel)
@@ -966,6 +990,8 @@ class  MapViewer(object):
         self.vehicle_id_surface.set_clip(clipping_rect)
         self.result_surface.set_clip(clipping_rect)
         self.shadow_surface.set_clip(clipping_rect)
+        self.dangerzone_surface.set_clip(clipping_rect)
+
 
     def _compute_scale(self, scale_factor):
         """Based on the mouse wheel and mouse position, it will compute the scale and move the map so that it is zoomed in or out based on mouse position"""
@@ -989,7 +1015,7 @@ class  MapViewer(object):
         # Scale performed
         self.map_image.scale_map(scale_factor)
 
-    def render(self, frame, shadow_list=None):
+    def render(self, frame, shadow_list=None, dangerzone_list = None):
         """Renders the map and all the actors in ego and map mode"""
         if self.actors_with_transforms is None:
             return
@@ -1014,6 +1040,7 @@ class  MapViewer(object):
             walkers)
 
         self._render_shadow(shadow_list, self.map_image.world_to_pixel)
+        self._render_dangerzone(dangerzone_list, self.map_image.world_to_pixel)
 
         # Render Ids
         self._render_vehicles_ids(vehicles, self.map_image.world_to_pixel)
@@ -1023,7 +1050,8 @@ class  MapViewer(object):
         surfaces = ((self.map_image.surface, (0, 0)),
                     (self.actors_surface, (0, 0)),
                     (self.vehicle_id_surface, (0, 0)),
-                    (self.shadow_surface, (0,0))
+                    (self.shadow_surface, (0,0)),
+                    (self.dangerzone_surface, (0,0))
                     )
 
         angle = self.ego_transform.rotation.yaw + 90.0 if self.ego_following else 0.0

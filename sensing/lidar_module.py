@@ -182,7 +182,7 @@ class Lidar(SensorBase):
         self.vis_points.points = o3d.utility.Vector3dVector(self.point_cloud)
         self.vis_points.colors = o3d.utility.Vector3dVector(int_color)
                
-    def setup_visualizer(self, name = 'Lidar', width=960, height=540):
+    def setup_visualizer(self, name = 'Lidar', width=540, height=540):
         """ function to setup open3d Visualizer for the lidar data"""
 
         self.frame_count = 0
@@ -198,7 +198,7 @@ class Lidar(SensorBase):
         self.visualizer.get_render_option().point_size = 1
         self.visualizer.get_render_option().show_coordinate_frame = True
 
-    def update_visualizer(self):
+    def update_visualizer(self, folder=None, id=None):
         """update the lidar visualizer"""
         if self.visualizer:
             if self.frame_count == 2:
@@ -206,6 +206,9 @@ class Lidar(SensorBase):
             self.visualizer.update_geometry(self.vis_points)
             self.visualizer.poll_events()
             self.visualizer.update_renderer()
+            if folder is not None:
+                filename = folder+"lidar_%04d" % id+".jpeg"
+                self.visualizer.capture_screen_image(filename)
             time.sleep(0.001)
             self.frame_count += 1
 

@@ -65,7 +65,7 @@ def PraseArgs():
     argparser.add_argument(
         '--res',
         metavar='WIDTHxHEIGHT',
-        default='1280x720',
+        default='1280x960',
         help='window resolution (default: 1280x720)')
     
     # world parameters
@@ -181,6 +181,18 @@ def PraseArgs():
         default=None,
         type=str,
         help='Light Group [' + ' | '.join([i for i in LIGHT_GROUP]) + ']')
+    argparser.add_argument(
+        '--baseline',
+        default=False,
+        action="store_true",
+        help='Boolean to choose between close loop and baseline planner')
+    argparser.add_argument(
+        '--obstacle', '-obj',
+        default=False,
+        action="store_true",
+        help='Boolean to determine if obstacle exists')
+    
+    
 
     args = argparser.parse_args()
 

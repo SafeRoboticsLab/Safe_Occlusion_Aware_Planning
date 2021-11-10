@@ -23,7 +23,7 @@ class VehicleRecord():
             Last detected bounding box (containing its location and rotation)
             Last detected velocity
     """
-    def __init__(self, carla_actor: carla.Vehicle, t, waypoint, a_max = 6, v_min = 0, v_max = 15):
+    def __init__(self, carla_actor: carla.Vehicle, t, waypoint, a_max = 8, v_min = 0, v_max = 15):
         self.actor = carla_actor
         self.id = self.actor.id
         
@@ -33,7 +33,8 @@ class VehicleRecord():
         self.bbox = None # this containing the rotation and tranlation of vehicle center
         self.velocity = None
 
-        self.a_max = a_max
+        self.a_max_decel = a_max
+        self.a_max_accel = a_max/2
         self.v_min = v_min
         self.v_max = v_max
 
@@ -41,7 +42,8 @@ class VehicleRecord():
 
         if "carlacola" in self.actor.type_id:
             self.v_max = 15
-            self.a_max = 4
+            self.a_max_decel = 4
+            self.a_max_accel = 2
 
     def update(self, t, waypoint):
         self.waypoint = waypoint
@@ -78,7 +80,7 @@ class VehicleRecord():
             else:
                 FRS = LineString([(- self.bbox.ext_x, v_frenet), (self.bbox.ext_x, v_frenet)])
         else:
-            FRS = double_integrator_FRS(v_frenet, v_frenet, delta_t, delta_t, self.a_max, self.v_min, self.v_max, x_extend=self.bbox.ext_x, oppo=oppo)
+            FRS = double_integrator_FRS(v_frenet, v_frenet, delta_t, delta_t, self.a_max_accel, self.a_max_decel, self.v_min, self.v_max, x_extend=self.bbox.ext_x, oppo=oppo)
 
         return FRS
     
@@ -198,7 +200,7 @@ class Bbox():
 class ObjectUtils():
     def __init__(self, client: SynchronousClient, road_network: RoadNetwork):
         self.client = client
-        self.ego_id = self.client.ego.id # to be ignored during update
+        self.ego_id = self.client.ego_id # to be ignored during update
         self.road_network = road_network
         self.obstacle_list = {}
         # a look up table. 
@@ -247,13 +249,18 @@ class ObjectUtils():
         waypoint = self.client.map.get_waypoint(self.client.ego.get_location(), project_to_road=True, lane_type=carla.LaneType.Driving)
         self.road_network.update_state_batch(t, waypoint.road_id, waypoint.section_id, waypoint.lane_id, waypoint.s, 
                     [self.client.ego.bounding_box.extent.x+1, self.client.ego.bounding_box.extent.x+1], from_end=False, ds_global=True)
-
+        #print("Update at ", t)
         for obj in observed_obj_list:
+            obj = int(obj)
             if obj == 0 or obj == self.ego_id:
                 continue # what is 0?
-            obj = int(obj)
             
+            object_data = semantic_point_cloud[semantic_point_cloud['ObjIdx']==obj]            
+            if len(object_data)<3:
+                continue
+            #print("observed", obj, len(object_data))
             if obj not in self.obstacle_list:
+                print("observed", obj)
                 actor = self.client.world.get_actor(obj)
                 waypoint = self.client.map.get_waypoint(actor.get_location(), project_to_road=True, lane_type=carla.LaneType.Driving)
                 self.obstacle_list[obj] = VehicleRecord(actor, t, waypoint)

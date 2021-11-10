@@ -32,7 +32,7 @@ class InteractivePlanner:
         self.infoSpace.reset_prediction()
         
         self.frontier = Queue()
-        self.add_node(p0, l0, v0, 0, None)
+        self.add_node(p0, l0, v0, 0, None,0,0)
         self.active_node.add_predict_shadow(self.shadow_list)
         self.t0 = t0
         self.poped_node = []
@@ -128,8 +128,9 @@ class InteractivePlanner:
                     a_plan = (dp - v_cur*self.dt)/(0.5*self.dt**2)
                     v_plan = v_cur+a_plan*self.dt
                     print("plane to p={}, l={}, v={}, t={}".format(p_plan, l_plan, v_plan, t_plan ))
-                    if not self.infoSpace.state_checker.is_safe_plan(p_plan, l_plan, v_plan, 0, t_cur, t_plan, 
-                                                        self.obstacle_predictor, shadow_map, use_record = True, debug = True):
+                    issafe, cross_cost, opposite_cost = self.infoSpace.state_checker.is_safe_plan(p_plan, l_plan, v_plan, 0, t_cur, t_plan, 
+                                                        self.obstacle_predictor, shadow_map, use_record = True, debug = True)
+                    if not issafe:
                         print("not safe")
                     else:
                         self.add_node(p_plan, l_plan, v_plan, cur_node.t+self.dt, cur_node)
@@ -138,14 +139,14 @@ class InteractivePlanner:
                    
         return add_node
             
-    def add_node(self, p, l, v, t, parent):
+    def add_node(self, p, l, v, t, parent, cross_cost, opposite_cost):
         if parent is None:
             cost2come = 0
         else:
             cost_turn = abs(l-parent.l)
             # cost_off_center = abs(l%3.6-1.8)
             # cost_opposite_lane = 2*(l<=0)
-            cost2come = parent.cost2come + 0*cost_turn #+ 1*cost_off_center+cost_opposite_lane
+            cost2come = parent.cost2come + 0*cost_turn + 0.05*cross_cost + 0.1*opposite_cost
         p_round = np.round(p, 4)
         l_round = np.round(l, 4)
 

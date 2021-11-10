@@ -1,3 +1,4 @@
+from os import P_ALL
 from commonroad.common.validity import is_list_of_natural_numbers
 import numpy as np
 from queue import PriorityQueue, Queue
@@ -9,12 +10,13 @@ from datetime import datetime
 
 
 class A_star:
-    def __init__(self, infoSpace: ISpace, lattice: Lattice, v_max, a_max, dt, T_plan):
+    def __init__(self, infoSpace: ISpace, lattice: Lattice, v_max, a_max_accel, a_max_decel, dt, T_plan):
         self.infoSpace = infoSpace
         self.lattice = lattice
         self.dt = dt
         self.v_max = v_max
-        self.a_max = a_max
+        self.a_max_accel = a_max_accel
+        self.a_max_decel = a_max_decel
         self.T_plan = T_plan # total time horizon
         self.frontier = None
         self.goal_node = None
@@ -22,7 +24,7 @@ class A_star:
         self.debug = False
         self.obstacle_predictor = self.infoSpace.object_manager.predict_obstacle
 
-    def plan(self, p0, l0, v0, t0, shadow_map, shadow_list, debug= False):       
+    def plan(self, p0, l0, v0, t0, goal_p, shadow_map, shadow_list, debug= False):       
         self.debug = debug
 
         self.infoSpace.reset_prediction()
@@ -32,17 +34,35 @@ class A_star:
         self.goal_node = None
 
         self.frontier = PriorityQueue()
-        self.add_node(p0, l0, v0, 0, None)
+        self.add_node(p0, l0, v0, 0, None, 0, 0)
         self.t0 = t0
+
+        minL = 0
 
         while not self.frontier.empty():
             cur_node = self.frontier.get()
             if self.lattice.add_node(cur_node):
-                if cur_node.t >= self.T_plan or cur_node.p >= self.lattice.p_list[-1]:
-                    #print(cur_node.s, cur_node.cost2come, cur_node.cost2go, cur_node.v)
+                if cur_node.l<minL and self.debug:
+                    print("Poped:", minL, cur_node.t)
+                    minL = cur_node.l
+
+                if goal_p is None:
+                    if cur_node.t >= self.T_plan:
+                        self.goal_node = cur_node
+                        break
+                elif cur_node.p>=goal_p and cur_node.l>=0:
+                    print("Planner Reaching the goal")
                     self.goal_node = cur_node
                     break
-                #print("poped ", cur_node.p, cur_node.l, cur_node.v, cur_node.t)
+                elif cur_node.p>=goal_p and cur_node.l<0:
+                    continue
+                elif cur_node.t >= self.T_plan:
+                    print("Planner Reaching the timestep limit")
+                    self.goal_node = cur_node
+                    break
+                
+                if self.debug:
+                    print("poped ", cur_node.p, cur_node.l, cur_node.v, cur_node.t)
                 ego_pose = self.lattice.lattice_2_global(cur_node.p, cur_node.l)
                 ego_loc = [ego_pose.location.x, ego_pose.location.y, ego_pose.location.z+1.8]
                 
@@ -61,7 +81,7 @@ class A_star:
         process_time = datetime.now() - dt0
         print("Takes ", process_time.total_seconds(), " sec to plan")
     
-    def plan_openloop(self, p0, l0, v0, t0, shadow_map, shadow_list, debug= False):
+    def plan_openloop(self, p0, l0, v0, t0, goal_p, shadow_map, debug= False):
 
         self.debug = debug
 
@@ -72,14 +92,24 @@ class A_star:
         self.goal_node = None
 
         self.frontier = PriorityQueue()
-        self.add_node(p0, l0, v0, 0, None)
+        self.add_node(p0, l0, v0, 0, None, 0, 0)
         self.t0 = t0
 
         while not self.frontier.empty():
             cur_node = self.frontier.get()
             if self.lattice.add_node(cur_node):
-                if cur_node.t >= self.T_plan or cur_node.p >= self.lattice.p_list[-1]:
-                    #print(cur_node.s, cur_node.cost2come, cur_node.cost2go, cur_node.v)
+                if goal_p is None:
+                    if cur_node.t >= self.T_plan:
+                        self.goal_node = cur_node
+                        break
+                elif cur_node.p>=goal_p and cur_node.l>=-1:
+                    print("Planner Reaching the goal")
+                    self.goal_node = cur_node
+                    break
+                elif cur_node.p>=goal_p and cur_node.l<-1:
+                    continue
+                elif cur_node.t >= self.T_plan:
+                    print("Planner Reaching the timestep limit")
                     self.goal_node = cur_node
                     break
                 #print("poped ", cur_node.p, cur_node.l, cur_node.v, cur_node.t)                
@@ -97,39 +127,52 @@ class A_star:
         t_plan = t_cur + self.dt
                         
         def max_lateral_a(dl):
-            return (4*dl)/(self.dt**2)
+            return (4*np.abs(dl))/(self.dt**2)
         
-        def min_max_progress(a_max):
+        def min_max_progress(a_max_accel, a_max_decel):
             # calculate admissible traj length
-            t2minV = min(self.dt, v_cur/self.a_max)
-            min_dp = v_cur*t2minV-0.5*a_max*t2minV**2
-            t2maxV = min(self.dt, max(0,(self.v_max - v_cur)/self.a_max))
-            max_dp = v_cur*t2maxV+0.5*a_max*t2maxV**2+self.v_max*max(0, self.dt-t2maxV)
+            if a_max_decel == 0:
+                t2minV = self.dt
+            else:
+                t2minV = min(self.dt, v_cur/a_max_decel)
+            
+            min_dp = v_cur*t2minV-0.5*a_max_decel*t2minV**2
+
+            if a_max_accel == 0:
+                t2maxV = self.dt
+            else:
+                t2maxV = min(self.dt, max(0,(self.v_max - v_cur)/a_max_accel))
+            max_dp = v_cur*t2maxV+0.5*a_max_accel*t2maxV**2+self.v_max*max(0, self.dt-t2maxV)
             return min_dp, max_dp
 
-        dl_max = self.a_max*(self.dt**2)/4
-        num_dl_max = int(np.floor(dl_max/self.lattice.dl))
-        #print("max laterl motion", dl_max, num_dl_max)
-        for num_dl in range(-num_dl_max, num_dl_max+1):
-            l_plan = l_cur+num_dl*self.lattice.dl
-            a_lat = max_lateral_a(num_dl*self.lattice.dl)
-            a_lon_max = np.sqrt(self.a_max**2 - a_lat**2)
-            min_dp, max_dp = min_max_progress(a_lon_max)
+        dl_max = self.a_max_decel*(self.dt**2)/4
+        l_idx_max = int(np.floor((dl_max+l_cur)/self.lattice.dl))
+        l_idx_min = int(np.ceil((l_cur - dl_max)/self.lattice.dl))
+        
+        for l_idx in range(l_idx_min, l_idx_max+1):
+            l_plan = l_idx*self.lattice.dl
+            delta_l = l_plan-l_cur
+            a_lat = max_lateral_a(delta_l)
+            a_lon_decel_max = np.sqrt(self.a_max_decel**2 - a_lat**2)
+            a_lon_accel_max = min(self.a_max_accel, a_lon_decel_max)
+            min_dp, max_dp = min_max_progress(a_lon_accel_max, a_lon_decel_max)
             num_dp_min = int(np.ceil(min_dp/self.lattice.dp))
             num_dp_max = int(np.floor(max_dp/self.lattice.dp))
-            #print(l_plan)
         
             for num_dp in range(num_dp_min, num_dp_max+1):
-                p_plan = p_cur+num_dp*self.lattice.dp
+                delta_p = num_dp*self.lattice.dp
+                p_plan = p_cur+delta_p
                 # make sure this is an possible waypoint
-                if self.lattice.lattice_exist(p_plan, l_plan):
+                if (np.abs(delta_l)<=3*delta_p) and self.lattice.lattice_exist(p_plan, l_plan):
                     # assume constant acceleration during the step of planning
-                    a_plan = ((num_dp*self.lattice.dp) - v_cur*self.dt)/(0.5*self.dt**2)
-                    v_plan = v_cur+a_plan*self.dt
-
-                    if self.infoSpace.state_checker.is_safe_plan(p_plan, l_plan, v_plan, 0, self.t0, t_plan, 
-                                                        self.obstacle_predictor, shadow_map, use_record = True, debug = self.debug):
-                        self.add_node(p_plan, l_plan, v_plan, cur_node.t+self.dt, cur_node)
+                    a_plan = (delta_p - v_cur*self.dt)/(0.5*self.dt**2)
+                    v_plan = np.round(v_cur+a_plan*self.dt,4)
+                    if v_plan<0 or v_plan>self.v_max:
+                        continue
+                    issafe, cross_cost, opposite_cost =  self.infoSpace.state_checker.is_safe_plan(p_plan, l_plan, v_plan, 0, self.t0, t_plan, 
+                                                        self.obstacle_predictor, shadow_map, use_record = True, debug = self.debug)
+                    if issafe:
+                        self.add_node(p_plan, l_plan, v_plan, cur_node.t+self.dt, cur_node, cross_cost, opposite_cost)
                             
     def expand_node(self, cur_node,  shadow_map):
         t_cur = cur_node.t + self.t0
@@ -140,70 +183,88 @@ class A_star:
 
                         
         def max_lateral_a(dl):
-            return (4*dl)/(self.dt**2)
+            return (4*np.abs(dl))/(self.dt**2)
         
-        def min_max_progress(a_max):
+        def min_max_progress(a_max_accel, a_max_decel):
             # calculate admissible traj length
-            t2minV = min(self.dt, v_cur/self.a_max)
-            min_dp = v_cur*t2minV-0.5*a_max*t2minV**2
-            t2maxV = min(self.dt, max(0,(self.v_max - v_cur)/self.a_max))
-            max_dp = v_cur*t2maxV+0.5*a_max*t2maxV**2+self.v_max*max(0, self.dt-t2maxV)
+            if a_max_decel == 0:
+                t2minV = self.dt
+            else:
+                t2minV = min(self.dt, v_cur/a_max_decel)
+            
+            min_dp = v_cur*t2minV-0.5*a_max_decel*t2minV**2
+
+            if a_max_accel == 0:
+                t2maxV = self.dt
+            else:
+                t2maxV = min(self.dt, max(0,(self.v_max - v_cur)/a_max_accel))
+            max_dp = v_cur*t2maxV+0.5*a_max_accel*t2maxV**2+self.v_max*max(0, self.dt-t2maxV)
             return min_dp, max_dp
 
-        dl_max = self.a_max*(self.dt**2)/4
-        num_dl_max = int(np.floor(dl_max/self.lattice.dl))
+        dl_max = self.a_max_decel*(self.dt**2)/4
+        l_idx_max = int(np.floor((dl_max+l_cur)/self.lattice.dl))
+        l_idx_min = int(np.ceil((l_cur - dl_max)/self.lattice.dl))
         
-        for num_dl in range(-num_dl_max, num_dl_max+1):
-            delta_l =  num_dl*self.lattice.dl
-            l_plan = l_cur+delta_l
+        for l_idx in range(l_idx_min, l_idx_max+1):
+            l_plan = l_idx*self.lattice.dl
+            delta_l = l_plan-l_cur
             a_lat = max_lateral_a(delta_l)
-            a_lon_max = np.sqrt(self.a_max**2 - a_lat**2)
-            min_dp, max_dp = min_max_progress(a_lon_max)
+            a_lon_decel_max = np.sqrt(self.a_max_decel**2 - a_lat**2)
+            a_lon_accel_max = min(self.a_max_accel, a_lon_decel_max)
+            min_dp, max_dp = min_max_progress(a_lon_accel_max, a_lon_decel_max)
             num_dp_min = int(np.ceil(min_dp/self.lattice.dp))
             num_dp_max = int(np.floor(max_dp/self.lattice.dp))
+            if self.debug:
+                print("delta_l = :", delta_l, min_dp, max_dp, num_dp_min, num_dp_max)
         
             for num_dp in range(num_dp_min, num_dp_max+1):
                 delta_p = num_dp*self.lattice.dp
                 p_plan = p_cur+delta_p
                 # make sure this is an possible waypoint
-                if (delta_l<=3*delta_p) and self.lattice.lattice_exist(p_plan, l_plan):
+                if self.debug:
+                    pass
+                if (np.abs(delta_l)<=3*delta_p) and self.lattice.lattice_exist(p_plan, l_plan):
                     # assume constant acceleration during the step of planning
                     a_plan = (delta_p - v_cur*self.dt)/(0.5*self.dt**2)
                     v_plan = v_cur+a_plan*self.dt
-                    if self.infoSpace.state_checker.is_safe_plan(p_plan, l_plan, v_plan, 0, t_cur, t_plan, 
-                                                        self.obstacle_predictor, shadow_map, use_record = True, debug = self.debug):
-                        self.add_node(p_plan, l_plan, v_plan, cur_node.t+self.dt, cur_node)
+                    if v_plan<0 or v_plan>self.v_max:
+                        continue
+                    issafe, cross_cost, opposite_cost = self.infoSpace.state_checker.is_safe_plan(p_plan, l_plan, v_plan, 0, t_cur, t_plan, 
+                                                        self.obstacle_predictor, shadow_map, use_record = True, debug = self.debug)
+                    if issafe:
+                        self.add_node(p_plan, l_plan, v_plan, cur_node.t+self.dt, cur_node, cross_cost, opposite_cost)
             
-    def add_node(self, p, l, v, t, parent):
+    def add_node(self, p, l, v, t, parent, cross_cost, opposite_cost):
         if parent is None:
             cost2come = 0
         else:
             cost_turn = abs(l-parent.l)
             # cost_off_center = abs(l%3.6-1.8)
             # cost_opposite_lane = 2*(l<=0)
-            cost2come = parent.cost2come + 0*cost_turn #+ 1*cost_off_center+cost_opposite_lane
+            cost2come = parent.cost2come + 0*cost_turn + 0.02*cross_cost + 0.04*opposite_cost
         p_round = np.round(p, 4)
         l_round = np.round(l, 4)
 
         # calculate cost2go
-        v_max = self.v_max+self.a_max*self.dt*0.5
+        v_max = self.v_max+self.a_max_accel*self.dt*0.5
         t_remain = self.T_plan - t
-        t2maxV = min(t_remain, max(0,(v_max - v)/self.a_max))
-        cost2go = -p-1*(v*t2maxV + 0.5*self.a_max*t2maxV**2 + v_max*max(0,(t_remain-t2maxV)))  
+        t2maxV = min(t_remain, max(0,(v_max - v)/self.a_max_accel))
+        cost2go = -p-(v*t2maxV + 0.5*self.a_max_accel*t2maxV**2 + v_max*max(0,(t_remain-t2maxV)))
+        #print(p, l, v, t,-cost2go-cost2come)  
         node = Node(p_round, l_round, t, v, parent, cost2come, cost2go)
         self.frontier.put(node)
 
     def get_plan(self, dt_subsample):
-        plan_node = {}
+        if self.goal_node is None:
+            return None # no solution
         traj = {}
         cur_node = self.goal_node
         while cur_node.parent is not None:
-            plan_node[np.round(cur_node.t+self.t0, 2)] = cur_node
             t_sampled, p_sampled, l_sampled, v_sampled, vl_sampled = self._subsample_traj(cur_node, dt_subsample)
             for t, p, l, v, vl in zip(t_sampled, p_sampled, l_sampled, v_sampled, vl_sampled):
-                traj[t] = (p, l, v, vl, cur_node.p, cur_node.l, cur_node.v, cur_node.t+self.t0)            
+                traj[t] = (p, l, v, vl, cur_node.p, cur_node.l, cur_node.v, 0, cur_node.t+self.t0)            
             cur_node = cur_node.parent
-        return traj, plan_node
+        return traj
 
     def _subsample_traj(self, cur_node, dt_subsample):
         prev_node = cur_node.parent

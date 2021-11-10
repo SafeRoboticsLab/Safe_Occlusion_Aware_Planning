@@ -23,7 +23,7 @@ class ShadowUtils():
         """
 
         self.client = client
-        self.ego_id = self.client.ego.id # to be ignored during update
+        self.ego_id = self.client.ego_id # to be ignored during update
         self.ds = ds
 
         self.road_network = road_newtwork
@@ -32,8 +32,9 @@ class ShadowUtils():
         self.vis_checker_depth = DepthVisibility(self.road_network, range)
 
         self.v_max = float(v_max)
-        self.a_max = float(a_max)
-        self.shadow_stop_length = 0.5*(self.v_max**2)/self.a_max*1.1
+        self.a_max_accel = float(a_max/2)
+        self.a_max_decel = float(a_max)
+        self.shadow_stop_length = 40
 
         self.route = route
         
@@ -754,7 +755,7 @@ class ShadowUtils():
         if in_bound.ds_in_hist is None:
             return
         
-        step_mature = (t - self.v_max/self.a_max) # an obstacle can accelerate to the maximum speed from static 
+        step_mature = (t - self.v_max/self.a_max_accel) # an obstacle can accelerate to the maximum speed from static 
         new_ds_in_hist = []
         new_t_in_hist = []
         for ds_in_hist, t_in_hist in zip(in_bound.ds_in_hist, in_bound.t_in_hist):
@@ -762,7 +763,6 @@ class ShadowUtils():
             if idx_mature > 1:
                 new_ds_in_hist.append(ds_in_hist[idx_mature-1:])
                 new_t_in_hist.append(t_in_hist[idx_mature-1:])
-                #print("remove old inbound",self.v_max/self.a_max, step_mature, idx_mature, t_in_hist)
             else:
                 new_ds_in_hist.append(ds_in_hist)
                 new_t_in_hist.append(t_in_hist)
@@ -770,7 +770,7 @@ class ShadowUtils():
         in_bound.ds_in_hist = new_ds_in_hist
         in_bound.t_in_hist = new_t_in_hist
     
-    def calc_V_max(self, in_bound, dis, t):
+    def calc_V_max(self, in_bound, dis, t, debug = False):
         V_max_list = []
         if in_bound.ds_in_hist is None:
             ds_in_hist_list = [np.array([0])]
@@ -782,13 +782,15 @@ class ShadowUtils():
         for ds_in_hist, t_in_hist in zip(ds_in_hist_list, t_in_hist_list):
             delta_s = ds_in_hist+dis# distance between outbound and inbound
             delta_t = (t - t_in_hist)            
-            V_in_max = (delta_s - 0.5*self.a_max*delta_t**2)/delta_t
+            V_in_max = (delta_s - 0.5*self.a_max_decel*delta_t**2)/delta_t
             V_in_max[delta_t == 0] = self.v_max
             V_in_max[V_in_max<0] = 0
-            V_out_max = np.sqrt(V_in_max**2+2*self.a_max*delta_s)
+            V_out_max = np.sqrt(V_in_max**2+2*self.a_max_accel*delta_s)
             
                 
             V_out_max[V_out_max>self.v_max] = self.v_max
+            if debug:
+                print(V_out_max, delta_s, delta_t)
             V_max_list.append(V_out_max.min())
 
         return max(V_max_list)
@@ -800,12 +802,12 @@ class ShadowUtils():
         elif v0==0:
             return 0, 0
         
-        t_to_max = (self.v_max-v0)/self.a_max
+        t_to_max = (self.v_max-v0)/self.a_max_accel
 
         if dt < t_to_max:
-            return v0*dt+0.5*self.a_max*dt**2, v0+self.a_max*dt
+            return v0*dt+0.5*self.a_max_accel*dt**2, v0+self.a_max_accel*dt
         else:
-            return v0*dt+0.5*self.a_max*t_to_max**2+(dt-t_to_max)*self.v_max, self.v_max
+            return v0*dt+0.5*self.a_max_accel*t_to_max**2+(dt-t_to_max)*self.v_max, self.v_max
 
     @staticmethod
     def _append_child_node(parent_node, cur_node):
@@ -1010,7 +1012,7 @@ class ShadowUtils():
         static_length = 0
         for inbound, depth in zip(shadow.leaf_list, shadow.leaf_depth):
             if depth is None:
-                v_FRS, dis_FRS = FRS_bound(0, self.v_max, delta_t, delta_t, self.a_max, 0, self.v_max)
+                v_FRS, dis_FRS = FRS_bound(0, self.v_max, delta_t, delta_t, self.a_max_accel, self.a_max_decel, 0, self.v_max)
                 shell = []
                 for dis, v in zip(dis_FRS, v_FRS):
                     shell.append((dis, v))
@@ -1020,7 +1022,7 @@ class ShadowUtils():
                 v_max_cur = self.calc_V_max(inbound, depth-3, t_sense)
                 #print("last obsered at", t_sense, "with", v_max_cur)
                 max_extent,_ = self._calc_S_max(v_max_cur, delta_t)
-                v_FRS, dis_FRS = FRS_bound(0, v_max_cur, delta_t, delta_t, self.a_max, 0, self.v_max)
+                v_FRS, dis_FRS = FRS_bound(0, v_max_cur, delta_t, delta_t, self.a_max_accel, self.a_max_decel, 0, self.v_max)
 
                 dis_list = np.linspace(0, depth-3+max_extent, n)
                 v_max_list = [self.calc_V_max(inbound, dis, t_predict) for dis in dis_list]

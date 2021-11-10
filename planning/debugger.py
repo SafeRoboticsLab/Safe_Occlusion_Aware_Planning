@@ -2,7 +2,6 @@ import copy
 from risk_analysis.shadow import InOutBound
 from risk_analysis import ISpace
 from planning import Lattice, InteractivePlanner
-from .evasive_planner import Evasion
 from client import SynchronousClient
 import numpy as np
 from matplotlib import pyplot as plt
@@ -55,10 +54,11 @@ class Debugger():
     def tick(self, sensor_data, sensor_pose):
         
         # Update the information space based on sensor observation
-        shadow_map, shadow_list = self.info_space.update(self.t_cur, sensor_data, sensor_pose)
+        
         
 
         if self.t_cur >= self.t_replan:
+            shadow_map, shadow_list = self.info_space.update(self.t_cur, sensor_data, sensor_pose)
             print("replanning")
             self.lattice.reset(self.p_cur)
             self.planner.init(self.p_cur, self.l_cur, self.v_cur, self.t_cur, shadow_map, shadow_list)

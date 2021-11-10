@@ -1,2 +1,2 @@
 from .frame import Frame, Object
-from .record import Record
+from .record import Record, RecordUtil

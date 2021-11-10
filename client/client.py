@@ -70,6 +70,7 @@ class SynchronousClient(object):
         self.depth_camera_list = []
         self.rgb_camera_list = []
         self.spectator_camera = None
+        self.dt = dt
 
         # initialize the client
         host = self.args.host
@@ -83,6 +84,7 @@ class SynchronousClient(object):
         self.original_settings = self.world.get_settings()
 
         self.ego = None # ego vehilce
+        self.ego_id =None
         self.vehicle_list = []
         # apply the setting of Synchronous Mode
         self.world.set_weather(carla.WeatherParameters.ClearNoon)
@@ -90,7 +92,7 @@ class SynchronousClient(object):
         settings = self.world.get_settings()
         self.traffic_manager = self.client.get_trafficmanager(8000)
         self.traffic_manager.set_synchronous_mode(True)
-        settings.fixed_delta_seconds = dt
+        settings.fixed_delta_seconds = self.dt
         settings.synchronous_mode = True
         settings.no_rendering_mode = False
         self.world.apply_settings(settings)
@@ -129,12 +131,18 @@ class SynchronousClient(object):
             
         self.ego = self.world.spawn_actor(ego_bp, spawn_point)
         self.ego.set_autopilot(autopilot)
+        self.ego_id = self.ego.id
 
         # set up a spectator camera
         self.setup_ego_sensors()
+        self.setup_spectator(spectator_pose)
+
+        print("Set actor ", self.ego.id, " as the ego vehicle")
+
+    def setup_spectator(self, spectator_pose=[-5, 0, 2, 0, 4.0, 0]):
         self.spectator_camera = Camera(self.world, self.blueprint_library, self.ego, 
                         width=self.args.width*2, height=self.args.height*2, 
-                        fov=120, fps=1/self.args.dt, 
+                        fov=100, fps=1/self.dt, 
                         x=spectator_pose[0], y=spectator_pose[1], z=spectator_pose[2],
                         roll=spectator_pose[3], pitch=spectator_pose[4], yaw=spectator_pose[5],
                         attach=carla.AttachmentType.SpringArm)
@@ -145,7 +153,6 @@ class SynchronousClient(object):
         self.spectator_camera.set_intrinsic(calibration)
         self.spectator_camera.setup_visualizer(name="Spectator")
 
-        print("Set actor ", self.ego.id, " as the ego vehicle")
         
     def setup_ego_sensors(self):
         self.imu_sensor = IMU(self.world, self.blueprint_library, self.ego)
@@ -168,11 +175,20 @@ class SynchronousClient(object):
     def add_depth_camera(self, visualize = True, width=1920, height=1080, fov=110, fps=10.0, x=-0.5, y=0, z=1.8, roll=0, pitch=0, yaw=0, name = None):
         
         self.depth_camera_list.append(DepthCamera(self.world, self.blueprint_library, self.ego, 
-                width, height, fov, fps, x, y, z, roll, pitch, yaw))
+                width = width, height = height, fov = fov, fps = fps, x=x, y=y, z=z, roll=roll, pitch=pitch, yaw=yaw))
         if visualize:
             if name is None:
-                name = "Depth"+str(len(self.lidar_list))
+                name = "Depth"+str(len(self.depth_camera_list))
             self.depth_camera_list[-1].setup_visualizer(name = name)
+
+    def add_RGB_camera(self, visualize = True, width=1920, height=1080, fov=110, fps=10.0, x=-0.5, y=0, z=1.8, roll=0, pitch=0, yaw=0, name = None):
+        
+        self.rgb_camera_list.append(Camera(self.world, self.blueprint_library, self.ego,
+                width = width, height = height, fov = fov, fps = fps, x=x, y=y, z=z, roll=roll, pitch=pitch, yaw=yaw))
+        if visualize:
+            if name is None:
+                name = "RGB"+str(len(self.rgb_camera_list))
+            self.rgb_camera_list[-1].setup_visualizer(name = name)
         
     def get_actors(self):
         """
@@ -273,19 +289,25 @@ class SynchronousClient(object):
             self.radar_sensor.sensor.destroy()
             self.radar_sensor = None
 
-    def tick(self):
+    def tick(self, turn_off_traffic_light = True):
+        if turn_off_traffic_light:
+            for actor in self.get_actors():
+                if 'traffic_light' in actor.type_id:
+                    actor.set_state(carla.TrafficLightState.Off)
         self.world.tick()
 
-    def render(self):
+    def render(self, folder=None, id=None):
         """
         Update sensor images
         """
         if self.spectator_camera is not None:
-            self.spectator_camera.update_visualizer()
+            self.spectator_camera.update_visualizer(folder, id)
         for lidar in self.lidar_list:
-            lidar.update_visualizer()
+            lidar.update_visualizer(folder, id)
         for depth in self.depth_camera_list:
-            depth.update_visualizer()
+            depth.update_visualizer(folder, id)
+        for rgb in self.rgb_camera_list:
+            rgb.update_visualizer(folder, id)
         
     def destroy(self):
         if self.collision_sensor is not None:

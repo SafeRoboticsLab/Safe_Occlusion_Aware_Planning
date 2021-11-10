@@ -1,6 +1,3 @@
-from os import sendfile
-
-from commonroad.scenario.lanelet import Lanelet
 from client import SynchronousClient
 from mapping import RoadNetwork
 from planning import Route
@@ -9,6 +6,8 @@ from risk_analysis.reachable_set import double_integrator_stop_dangerzone as sto
 from risk_analysis.reachable_set import translate_polygon
 from risk_analysis.reachable_set import double_integrator_reachable_tube as reachable_tube
 from risk_analysis.reachable_set import double_integrator_merge_dangerzone as lane_change_dangerzone
+from risk_analysis.reachable_set import double_integrator_stop_distance as object_stop_distance
+from risk_analysis.dangzerzone_vis import DangerZonePlot
 import numpy as np
 from queue import Queue
 import heapq
@@ -25,24 +24,34 @@ class StateChecker():
         self.road_network = road_network
         self.route = route
         self.v_max = v_max#*1.2 # allow other agent to be 20% over speed limit
-        self.a_max = a_max
+        self.a_max_decel = a_max
+        self.a_max_accel = a_max/2
         self.ego_width = 2
         self.ego_length = 5
         self.debug = False
         self.debugger = self.client.world.debug
         self.slack_distance = 2.5
-        self.search_stop = 300
+        self.search_stop = 200
+        self.v_min = 5
 
-    def is_safe_plan(self, p_check, l_check, v_check, vl_check, t_sense, t_check, obstacle_predictor,  shadow_map_sense, use_record = False, debug=False):
+        self.record_danger_zone = False
+        self.dangerzone_list = []
+
+    def is_safe_plan(self, p_check, l_check, v_check, vl_check, t_sense, t_check, obstacle_predictor,  shadow_map_sense, record_danger_zone = False, use_record = False, debug=False):
         """
         Check if the ego object can safely move from ()_sense to ()_plan, given the predicted obstacle_map at t_check, shadow_map captured at t_sense 
         """
         self.debug = debug
+        self.record_danger_zone = record_danger_zone
+        if self.record_danger_zone:
+            self.dangerzone_list = []
         
         nominal_lanelet_id_check, ds_check = self.route.find_nominal_lane(p_check)
         lanelet_id_check, direction_check = self.route.find_lanelet_id(nominal_lanelet_id_check, l_check, self.ego_width)
+        cross_cost = 0
+        opposite_cost = 0
         if lanelet_id_check is None:
-            return False
+            issafe = False
         elif len(lanelet_id_check) == 1 and direction_check[0]:
             # the vehicle is entirely in ego lane
             issafe, _, _, _, _, _ = self._plan_close_loop_ego(lanelet_id_check[0], ds_check, p_check, l_check, v_check, vl_check, 
@@ -59,6 +68,7 @@ class StateChecker():
             issafe, _, _, _, _, _ = self._plan_close_loop_lane_change(lanelet_id_check[0], lanelet_id_target, ds_check, False, p_check, v_check,
                                                         l_check, vl_check, 1, dl_enter, dl_shield, dl_finish, t_sense, t_check, 
                                                         obstacle_predictor, shadow_map_sense, use_record)
+            opposite_cost = 2
         else:
             # cover two lanes
             left_lanelet_id = lanelet_id_check[0]
@@ -66,33 +76,50 @@ class StateChecker():
             left_direction = direction_check[0]
             right_direction = direction_check[1]
             section_check = self.route.get_route_section(p_check)
+
+            cross_cost = 1
            
             # shielding to the right lane   
-            if right_direction:         
-                l_bound, r_bound = section_check.get_boundary(right_lanelet_id)
-                dl_enter = l_bound - l_check - self.ego_width/2
-                dl_shield = l_bound - l_check + self.ego_width/2
-                dl_finish = r_bound - l_check - self.ego_width/2
-                shield_right,_, _, _, _, _ = self._plan_close_loop_lane_change(left_lanelet_id, right_lanelet_id, ds_check, left_direction, p_check, v_check,
-                                                            l_check, vl_check, 1, dl_enter, dl_shield, dl_finish, t_sense, t_check, 
-                                                            obstacle_predictor, shadow_map_sense, use_record)
+            if right_direction:   
+                issafe, _, _, _, _, _ = self._plan_close_loop_ego(right_lanelet_id, ds_check, p_check, l_check, v_check, vl_check, 
+                                             t_sense, t_check, obstacle_predictor,  shadow_map_sense, use_record)
+                if issafe:      
+                    l_bound, r_bound = section_check.get_boundary(right_lanelet_id)
+                    dl_enter = l_bound - l_check - self.ego_width/2
+                    dl_shield = l_bound - l_check + self.ego_width/2
+                    dl_finish = r_bound - l_check - self.ego_width/2
+
+                    shield_right,_, _, _, _, _ = self._plan_close_loop_lane_change(left_lanelet_id, right_lanelet_id, ds_check, left_direction, p_check, v_check,
+                                                                l_check, vl_check, 1, dl_enter, dl_shield, dl_finish, t_sense, t_check, 
+                                                                obstacle_predictor, shadow_map_sense, use_record)
+                else:
+                    shield_right = False
             else:
+                #opposite_cost = 1
                 shield_right = False
             
             if left_direction:
                 # shielding to the left lane
-                l_bound, r_bound = section_check.get_boundary(left_lanelet_id)
-                dl_enter = r_bound - l_check - self.ego_width/2
-                dl_shield = r_bound - l_check + self.ego_width/2
-                dl_finish = l_bound - l_check - self.ego_width/2
-                shield_left,_, _, _, _, _ = self._plan_close_loop_lane_change(right_lanelet_id, left_lanelet_id, ds_check, right_direction, p_check, v_check,
-                                                        l_check, vl_check, -1, dl_enter, dl_shield, dl_finish, t_sense, t_check, 
-                                                        obstacle_predictor, shadow_map_sense, use_record)
+                issafe, _, _, _, _, _ = self._plan_close_loop_ego(left_lanelet_id, ds_check, p_check, l_check, v_check, vl_check, 
+                                             t_sense, t_check, obstacle_predictor,  shadow_map_sense, use_record)
+                if issafe:
+                    l_bound, r_bound = section_check.get_boundary(left_lanelet_id)
+                    dl_enter = r_bound - l_check - self.ego_width/2
+                    dl_shield = r_bound - l_check + self.ego_width/2
+                    dl_finish = l_bound - l_check - self.ego_width/2
+                    shield_left,_, _, _, _, _ = self._plan_close_loop_lane_change(right_lanelet_id, left_lanelet_id, ds_check, right_direction, p_check, v_check,
+                                                            l_check, vl_check, -1, dl_enter, dl_shield, dl_finish, t_sense, t_check, 
+                                                            obstacle_predictor, shadow_map_sense, use_record)
+                else:
+                    shield_left = False
             else:
+                #opposite_cost = 1
                 shield_left = False
             issafe = shield_left or shield_right
+        if self.debug:
+            print("!!!!! checking", p_check, l_check, v_check, vl_check, t_check, "plan is ", issafe, "!!!!")
 
-        return issafe
+        return issafe, cross_cost, opposite_cost
             
     def plan_close_loop(self, p_cur, l_cur, v_cur, vl_cur, t_cur, t_plan, obstacle_predictor, shadow_map_cur, use_record = False, debug = False):
 
@@ -193,12 +220,12 @@ class StateChecker():
     def _plan_close_loop_ego(self, lanelet_id_check, ds_check, p_check, l_check, v_check, vl_check, t_sense, t_check, 
                                                             obstacle_predictor, shadow_map_sense, use_record, plan_step = 0.1):
         """ check if the ego stay in the same lane"""
+        #HACK
+        delta_t = min(t_check-t_sense, 0.5)
 
-        delta_t = t_check-t_sense
-
-        danger_zone, stop_distance = stop_dangerzone(v_check, self.a_max, self.v_max, x_extend=self.ego_length/2)
+        danger_zone, stop_distance = stop_dangerzone(v_check, self.a_max_decel, self.v_max, x_extend=self.ego_length/2)
         if self.debug:
-            print("in _plan_close_loop_ego", stop_distance)
+            print("in _plan_close_loop_ego")
         
         # predict where obstacles are
         obstacle_map_sense, occupied_lanelet_sense = obstacle_predictor(t_sense, use_record)
@@ -209,9 +236,9 @@ class StateChecker():
 
         issafe = True
         
-        a_brake_shadow = self.a_max
-        a_brake_obj = self.a_max
-        a_brake_lane_end = self.a_max
+        a_brake_shadow = self.a_max_accel
+        a_brake_obj = self.a_max_accel
+        a_brake_lane_end = self.a_max_accel
 
         v_shield = self.v_max # if planned the velocity is less than this, the ego vehicle can plan openloop again
 
@@ -223,12 +250,13 @@ class StateChecker():
                 if self.debug:
                     print("not able to stop before shadow")
                 issafe = False
-            else:
+            elif (p_remain - stop_distance)<v_check:
                 # plan one step for the close loop game from t_check
-                if self.debug:
-                    print(first_shadow, p_rel)
-                a_brake_shadow = min(-self.a_max/2, self._max_accel(v_check, 0, 0, p_remain-1, plan_step))
+                a_brake_shadow = -self.a_max_decel#min(-self.a_max*0.6, self._max_accel(v_check, 0, 0, p_remain-2, plan_step))
                 v_shield = 0
+            else:
+                a_brake_shadow = 0
+                          
         
         if lane_end is not None:
             _, p_rel = lane_end
@@ -237,13 +265,15 @@ class StateChecker():
                 if self.debug:
                     print("not able to stop before lane end")
                 issafe = False
-            else:
-                a_brake_lane_end = min(-self.a_max/2, self._max_accel(v_check, 0, 0, p_remain-1, plan_step))
+
+            elif (p_remain - stop_distance)<v_check:
+                a_brake_lane_end = -self.a_max_decel#min(-self.a_max*0.6, self._max_accel(v_check, 0, 0, p_remain-2, plan_step))
                 v_shield = 0
+            else:
+                a_brake_shadow = 0
 
         if first_obj is not None:
             # obstacle is closer than shadow
-            
             obstacle, v_frenet, p_rel = first_obj
             p_shift = p_rel - self.slack_distance
             FRS = translate_polygon(obstacle.calc_FRS(v_frenet, delta_t), p_shift)
@@ -253,8 +283,9 @@ class StateChecker():
                     plt.plot(*FRS.exterior.xy)
                 else:
                     plt.plot(*FRS.xy)
+                plt.title('280')
                 plt.show()
-                print(first_shadow, p_rel)
+                
             if not danger_zone.disjoint(FRS):
                 if self.debug:
                     print("not able to stop before obstacle")
@@ -264,12 +295,23 @@ class StateChecker():
                     p_remain = min(FRS.xy[0]) - self.ego_length/2 - 2
                 else:
                     p_remain = min(FRS.exterior.xy[0]) - self.ego_length/2 - 2
-                a_brake_obj = min(-self.a_max/2, self._max_accel(v_check, v_frenet, obstacle.a_max, p_remain, plan_step))
+                a_brake_obj = -self.a_max_decel#min(-self.a_max*0.6, self._max_accel(v_check, v_frenet, obstacle.a_max, p_remain, plan_step))
                 if self.debug:
                     print("Brake",  p_remain, a_brake_obj)
-                v_shield = v_frenet - obstacle.a_max*plan_step
+                v_shield = v_frenet - obstacle.a_max_decel*plan_step
+            
+            if self.record_danger_zone:
+                dangerzone_length = object_stop_distance(v_check, self.a_max_decel, v_frenet, obstacle.a_max_decel, self.ego_length/2)
+                cur_danger_zone_plot = DangerZonePlot()
+                cur_danger_zone_plot.search(lanelet_id_check, ds_check, dangerzone_length, True, True, danger_zone, self.road_network, self.route)
+                self.dangerzone_list.append(cur_danger_zone_plot)
+        elif self.record_danger_zone:
+            cur_danger_zone_plot = DangerZonePlot()
+            cur_danger_zone_plot.search(lanelet_id_check, ds_check, stop_distance, True, True, danger_zone, self.road_network, self.route)
+            self.dangerzone_list.append(cur_danger_zone_plot)
 
-        a_plan = max(-self.a_max, min([a_brake_shadow, a_brake_obj, a_brake_lane_end]))
+        #a_plan = max(-self.a_max, min([a_brake_shadow, a_brake_obj, a_brake_lane_end]))
+        a_plan = min([a_brake_shadow, a_brake_obj, a_brake_lane_end])
 
         if first_intersection is not None:
             intersection_id, p_to_intersection = first_intersection # p_to_intersection is the distance from current position to intersection
@@ -281,31 +323,43 @@ class StateChecker():
                     print("slow and fast both impossible")
                 issafe = False
             elif not fast_ok:
-                a_plan = -self.a_max
+                if self.debug:
+                    print("Only slow is possible Apply brake")
+                a_plan = -self.a_max_decel
             elif not slow_ok:
                 p_exit = p_check+p_rel_terminal
                 safe_exit = self.is_safe_plan(p_exit, l_check, v_terminal, 0, t_sense, t_terminal, obstacle_predictor, shadow_map_sense, use_record, self.debug)
                 if not safe_exit:
                     issafe = False
                 else:
-                    a_plan = self.a_max
+                    if self.debug:
+                        print("Only speedup is possible Apply brake")
+                    a_plan = self.a_max_accel
             else:
+                if self.debug:
+                    print("Both slow and fast is possible Apply brake")
                 # both slow and quick is ok
                 a_plan = min(a_plan,0)
         else:
             a_plan = min(a_plan,0)
 
-        a_lon = a_plan
-        a_lat_max = np.sqrt(self.a_max**2 - a_lon**2)
+        
         if vl_check != 0:
-            a_lat = -np.sign(vl_check)*min(vl_check/plan_step, a_lat_max)
+            a_lat = -np.sign(vl_check)*min(np.abs(vl_check)/plan_step, self.a_max_decel)
             vl_plan = vl_check+a_lat*plan_step
-            l_plan = l_check+vl_check*plan_step+0.5*a_lat*plan_step**2          
+            l_plan = l_check+vl_check*plan_step+0.5*a_lat*plan_step**2        
+            #print("Close Plan Lateral to ", a_lat, vl_plan, l_plan)  
         else:
             l_plan = l_check
             vl_plan = 0
             a_lat = 0
-               
+
+        a_lon_max = min(self.a_max_accel, np.sqrt(self.a_max_decel**2 - a_lat**2))
+        if abs(a_plan)>a_lon_max:
+            a_lon = np.sign(a_plan)*a_lon_max
+        else:
+            a_lon = a_plan
+                       
         v_plan = v_check+a_lon*plan_step
         if v_plan > self.v_max and a_lon>0:
             t_2_max = (self.v_max - v_check)/a_lon
@@ -323,7 +377,7 @@ class StateChecker():
         
         is_shield = (v_plan <= v_shield) and (vl_plan == 0)
         if self.debug:
-            print(v_plan, v_shield)
+            print("close loop planned: ", p_plan, l_plan, v_plan, vl_plan, is_shield)
         
         return issafe, p_plan, l_plan, v_plan, vl_plan, is_shield
         
@@ -336,7 +390,8 @@ class StateChecker():
         """
         
         obstacle_map_check, _ = obstacle_predictor(t_check, use_record)
-        delta_t = t_check - t_sense
+        delta_t = min(t_check - t_sense, 0.5)
+        
         
         cur_lane = self.road_network.find_lane_id(lanelet_id)
         cur_lanelet_id = cur_lane.lanelet_id
@@ -350,7 +405,7 @@ class StateChecker():
         first_merged_obj = None
 
         lane_end = None
-        p_rel_obs = np.inf
+        p_rel_obs = self.search_stop
         # get an idea of what is ahead
         while p_covered < self.search_stop:
             if first_obj is None:
@@ -364,7 +419,7 @@ class StateChecker():
                         sorted_obj = heapq.nlargest(len(cur_obj_queue), cur_obj_queue)
                     for obs_ds, v_frenet, obstacle in sorted_obj:
                         p_rel = cur_lane.delta_s_from_begin(obs_ds)+p_covered
-                        p_rel_front = p_rel + 0.5*obstacle.a_max*delta_t
+                        p_rel_front = p_rel + 0.5*obstacle.a_max_accel*delta_t**2
                         if p_rel_front>0:
                             obs_id = obstacle.id
                             lanelet_sense = occupied_lanelet_sense[obs_id]
@@ -524,45 +579,30 @@ class StateChecker():
 
         risk_lane_list = heapq.nsmallest(len(risk_lane_list), risk_lane_list)
 
-        
-        
-
-        p_enter_rel = risk_lane_list[0][0]
+    
+        p_enter_rel = risk_lane_list[0][0]-self.slack_distance/2
         
         slow_ok = True
         fast_ok = True
         v_terminal = 0
         t_terminal = 0
         p_rel_terminal = 0
-        stop_dis = v_check**2/(2*self.a_max)
+        stop_dis = v_check**2/(2*self.a_max_decel)
         if self.debug:
             print("stop distance: ", stop_dis, "first intersection", p_enter_rel)
         if stop_dis<p_enter_rel:
-            if self.debug:
+            if self.debug or self.record_danger_zone:
                 print("Stop before intersection", stop_dis, p_enter_rel)
-            return True, True, v_terminal, t_terminal, p_rel_terminal
-
-        if risk_lane_list[-1][1] <=0.5:
-            """ pass all intersection """
-            v_terminal = v_check
-            t_terminal = t_terminal
-            p_rel_terminal = 0
-            return True, True, v_terminal, t_terminal, p_rel_terminal
-        elif p_enter_rel>=0:
-            """ if the ego has not enter the intersection """
-            t_enter_slow, v_enter_slow = self.time2finish(v_check, -self.a_max, p_enter_rel, self.v_max)
-            t_enter_fast, v_enter_fast = self.time2finish(v_check, self.a_max, p_enter_rel, self.v_max)
+            
+            """ check fast """
+            t_enter_fast, v_enter_fast = self.time2finish(v_check, self.a_max_accel, p_enter_rel, self.v_max)
             for p_in_rel, p_out_rel, risky_lane in risk_lane_list:
                 if self.debug:
                     print("check risky lane before intersection:", risky_lane.lanelet_id)
-                t_slow_in, v_slow_in =   self.time2finish(v_enter_slow, self.a_max, 
-                                                p_in_rel - p_enter_rel, self.v_max)+t_enter_slow
-                t_slow_out, v_slow_out = self.time2finish(v_enter_slow, self.a_max, 
-                                                p_out_rel - p_enter_rel, self.v_max)+t_enter_slow
-
-                t_fast_in, v_fast_in =   self.time2finish(v_enter_fast, self.a_max, 
+                
+                t_fast_in, v_fast_in =   self.time2finish(v_enter_fast, self.a_max_accel, 
                                                 p_in_rel - p_enter_rel, self.v_max)+t_enter_fast
-                t_fast_out, v_fast_out = self.time2finish(v_enter_fast, self.a_max, 
+                t_fast_out, v_fast_out = self.time2finish(v_enter_fast, self.a_max_accel, 
                                                 p_out_rel - p_enter_rel, self.v_max)+t_enter_fast
                 #print(t_enter_slow, t_enter_fast, t_slow_in, t_slow_out, t_fast_in, t_fast_out)
                 if t_fast_out>t_terminal:
@@ -573,15 +613,81 @@ class StateChecker():
                 cross_ds = risky_lane.get_cross_ds(intersection_id, intersection_lane)
                 ego_lane_width = np.abs(cross_ds[0]-cross_ds[1])
 
-                BRT_slow = reachable_tube(0, self.v_max, t_slow_in, t_slow_out, self.a_max, 0, self.v_max, ego_lane_width/2, BRS=True)
-                BRT_fast = reachable_tube(0, self.v_max, t_fast_in, t_fast_out, self.a_max, 0, self.v_max, ego_lane_width/2, BRS=True)
-                
-                # plt.plot(*BRT_slow.exterior.xy)
-                # plt.plot(*BRT_fast.exterior.xy)
-                # plt.show()
+                BRT_fast = reachable_tube(0, self.v_max, t_fast_in, t_fast_out, self.a_max_accel, self.a_max_decel, 0, self.v_max, ego_lane_width/2, BRS=True)
+                results, first_risk_v = self._check_intersection_bwd(risky_lane, (cross_ds[0]+cross_ds[1])/2, t_sense, t_check, 
+                                                        [BRT_fast], obstacle_map_sense, shadow_map_sense)
+                if self.record_danger_zone:
+                    BRT_ds = BRT_fast.exterior.xy[0]
+                    danger_zone_ds_min = min(BRT_ds)
+                    danger_zone_ds_max = max(BRT_ds)
+                    danger_zone_ds_min = max(danger_zone_ds_min, - first_risk_v*t_fast_out-0.5*t_fast_out**2*self.a_max_accel-2)
+                    BRT_ds_start = (cross_ds[0]+cross_ds[1])/2-np.sign(risky_lane.lane_id)*danger_zone_ds_max
+                    BRT_length = abs(danger_zone_ds_max - danger_zone_ds_min)
+                    #print("!!!Length:", BRT_length)
+                    cur_danger_zone_plot = DangerZonePlot()
+                    cur_danger_zone_plot.search(risky_lane.lanelet_id, BRT_ds_start, BRT_length, False, False, BRT_fast, self.road_network, self.route)
+                    self.dangerzone_list.append(cur_danger_zone_plot)
 
-                results = self._check_intersection_bwd(risky_lane, (cross_ds[0]+cross_ds[1])/2, t_sense, t_check, 
+
+                if not results[0]:
+                    fast_ok = False
+
+        elif risk_lane_list[-1][1] <=0.5:
+            """ pass all intersection """
+            v_terminal = v_check
+            t_terminal = t_terminal
+            p_rel_terminal = 0
+            return True, True, v_terminal, t_terminal, p_rel_terminal
+        elif p_enter_rel>=0:
+            """ if the ego has not enter the intersection """
+            t_enter_slow, v_enter_slow = self.time2finish(v_check, -self.a_max_decel, p_enter_rel, self.v_max)
+            t_enter_fast, v_enter_fast = self.time2finish(v_check, self.a_max_accel, p_enter_rel, self.v_max)
+            for p_in_rel, p_out_rel, risky_lane in risk_lane_list:
+                if self.debug:
+                    print("check risky lane before intersection:", risky_lane.lanelet_id)
+                t_slow_in, v_slow_in =   self.time2finish(v_enter_slow, self.a_max_accel, 
+                                                p_in_rel - p_enter_rel, self.v_max)+t_enter_slow
+                t_slow_out, v_slow_out = self.time2finish(v_enter_slow, self.a_max_accel, 
+                                                p_out_rel - p_enter_rel, self.v_max)+t_enter_slow
+
+                t_fast_in, v_fast_in =   self.time2finish(v_enter_fast, self.a_max_accel, 
+                                                p_in_rel - p_enter_rel, self.v_max)+t_enter_fast
+                t_fast_out, v_fast_out = self.time2finish(v_enter_fast, self.a_max_accel, 
+                                                p_out_rel - p_enter_rel, self.v_max)+t_enter_fast
+                #print(t_enter_slow, t_enter_fast, t_slow_in, t_slow_out, t_fast_in, t_fast_out)
+                if t_fast_out>t_terminal:
+                    t_terminal = t_fast_out
+                    v_terminal = v_fast_out
+                    p_rel_terminal = p_out_rel
+                # ds of riskylane where the ego path goes through
+                cross_ds = risky_lane.get_cross_ds(intersection_id, intersection_lane)
+                ego_lane_width = np.abs(cross_ds[0]-cross_ds[1])
+
+                BRT_slow = reachable_tube(0, self.v_max, t_slow_in, t_slow_out, self.a_max_accel, self.a_max_decel, 0, self.v_max, ego_lane_width/2, BRS=True)
+                BRT_fast = reachable_tube(0, self.v_max, t_fast_in, t_fast_out, self.a_max_accel, self.a_max_decel, 0, self.v_max, ego_lane_width/2, BRS=True)
+                
+                results, first_risk_v = self._check_intersection_bwd(risky_lane, (cross_ds[0]+cross_ds[1])/2, t_sense, t_check, 
                                                         [BRT_slow, BRT_fast], obstacle_map_sense, shadow_map_sense)
+
+                if self.record_danger_zone:
+                    danger_zone = BRT_slow.intersection(BRT_fast)
+                    danger_zone_ds = danger_zone.exterior.xy[0]
+                    danger_zone_ds_min = min(danger_zone_ds)
+                    danger_zone_ds_max = max(danger_zone_ds)
+                    # velocity_polygon = Polygon([(danger_zone_ds_min, 0), (danger_zone_ds_min, first_risk_v), 
+                    #                             (danger_zone_ds_max, first_risk_v), (danger_zone_ds_max, 0)])
+                    # dangerzone_active = danger_zone.intersection(velocity_polygon)
+                    # dangerzone_active_ds = dangerzone_active.exterior.xy[0]
+                    # danger_zone_ds_min = min(dangerzone_active_ds)
+                    # danger_zone_ds_max = max(dangerzone_active_ds)
+                    danger_zone_ds_min = max(danger_zone_ds_min, -first_risk_v*t_fast_out-0.5*t_fast_out**2*self.a_max_accel-2)
+                    danger_zone_ds_start = (cross_ds[0]+cross_ds[1])/2-np.sign(risky_lane.lane_id)*danger_zone_ds_max
+                    danger_zone_length = abs(danger_zone_ds_max - danger_zone_ds_min)
+                    cur_danger_zone_plot = DangerZonePlot()
+                    cur_danger_zone_plot.search(risky_lane.lanelet_id, danger_zone_ds_start, danger_zone_length, False, True, BRT_fast, self.road_network, self.route)
+                    self.dangerzone_list.append(cur_danger_zone_plot)
+
+                
                 if not results[0]:
                     slow_ok = False
                 if not results[1]:
@@ -591,7 +697,7 @@ class StateChecker():
             if self.debug:
                 print("enter intersection", slow_ok, fast_ok ) 
         else:
-            slow_ok = False
+            slow_ok = False 
             for p_in_rel, p_out_rel, risky_lane in risk_lane_list:
                 if self.debug:
                     print("check risky lane in intersection:", risky_lane.lanelet_id)
@@ -599,23 +705,43 @@ class StateChecker():
                     continue
                 elif p_in_rel<0:
                     # planned trajectory is crossing this lane
-                    t_out, v_out = self.time2finish(v_check, self.a_max, 
+                    t_out, v_out = self.time2finish(v_check, self.a_max_accel, 
                                                 p_out_rel , self.v_max)
                     # ds of riskylane where the ego path goes through
                     cross_ds = risky_lane.get_cross_ds(intersection_id, intersection_lane)
                     ego_lane_width = np.abs(cross_ds[0]-cross_ds[1])
-                    danger_zone = reachable_tube(0, self.v_max, 0, t_out, self.a_max, 0, self.v_max, ego_lane_width/2, BRS=True)
+                    danger_zone = reachable_tube(0, self.v_max, 0, t_out, self.a_max_accel, self.a_max_decel, 0, self.v_max, ego_lane_width/2, BRS=True)
                     
                 else:
-                    t_in, v_in =   self.time2finish(v_check, self.a_max, 
+                    t_in, v_in =   self.time2finish(v_check, self.a_max_accel, 
                                                 p_in_rel , self.v_max)
-                    t_out, v_out = self.time2finish(v_check, self.a_max, 
+                    t_out, v_out = self.time2finish(v_check, self.a_max_accel, 
                                                 p_out_rel , self.v_max)
                     cross_ds = risky_lane.get_cross_ds(intersection_id, intersection_lane)
                     ego_lane_width = np.abs(cross_ds[0]-cross_ds[1])
-                    danger_zone = reachable_tube(0, self.v_max, t_in, t_out, self.a_max, 0, self.v_max, ego_lane_width/2, BRS=True)
-                results = self._check_intersection_bwd(risky_lane, (cross_ds[0]+cross_ds[1])/2, t_sense, t_check, 
+                    danger_zone = reachable_tube(0, self.v_max, t_in, t_out, self.a_max_accel, self.a_max_decel, 0, self.v_max, ego_lane_width/2, BRS=True)
+
+                results, first_risk_v = self._check_intersection_bwd(risky_lane, (cross_ds[0]+cross_ds[1])/2, t_sense, t_check, 
                                                     [danger_zone], obstacle_map_sense, shadow_map_sense)
+
+                if self.record_danger_zone:
+                    danger_zone_ds = danger_zone.exterior.xy[0]
+                    danger_zone_ds_min = min(danger_zone_ds)
+                    danger_zone_ds_max = max(danger_zone_ds)
+
+                    # velocity_bound = Polygon([(danger_zone_ds_min, first_risk_v),(danger_zone_ds_max, first_risk_v)])
+                    # dangerzone_active = danger_zone.intersection(velocity_bound)
+
+                    # dangerzone_active_ds = dangerzone_active.exterior.xy[0]
+                    # danger_zone_ds_min = min(dangerzone_active_ds)
+                    # danger_zone_ds_max = max(dangerzone_active_ds)
+                    danger_zone_ds_min = max(danger_zone_ds_min,  - first_risk_v*t_out-0.5*t_out**2*self.a_max_accel - 2)
+                    danger_zone_ds_start = (cross_ds[0]+cross_ds[1])/2-np.sign(risky_lane.lane_id)*danger_zone_ds_max
+                    danger_zone_length = abs(danger_zone_ds_max - danger_zone_ds_min)
+                    cur_danger_zone_plot = DangerZonePlot()
+                    cur_danger_zone_plot.search(risky_lane.lanelet_id, danger_zone_ds_start, danger_zone_length, False, True, danger_zone, self.road_network, self.route)
+                    self.dangerzone_list.append(cur_danger_zone_plot)
+
                 if t_out>t_terminal:
                     t_terminal = t_out
                     v_terminal = v_out
@@ -641,6 +767,9 @@ class StateChecker():
 
         results_list = [True for _ in danger_zone_list]
 
+        first_risk_dis = -self.search_stop
+        first_risk_v = self.v_max
+
         while not lane_queue.empty():
             cur_lanelet_id, processed_ds = lane_queue.get()
             cur_lane = self.road_network.find_lane_id(cur_lanelet_id)
@@ -660,13 +789,24 @@ class StateChecker():
                     FRS = translate_polygon(obstacle.calc_FRS(v_frenet, delta_t), -p_shift)
                     if self.debug:
                         print("FRS shift", -p_shift, v_frenet, cur_lanelet_id, cur_lane.delta_s_from_end(obs_ds), processed_ds)
-                                              
+
+                    if isinstance(FRS, LineString):
+                        FRS_bound = FRS.xy
+                    else:
+                        FRS_bound = FRS.exterior.xy
+                    
+                    FRS_bound_max_dis = max(FRS_bound[0])
+                    FRS_bound_max_v = max(FRS_bound[1])
+                    if FRS_bound_max_dis > first_risk_dis:
+                        first_risk_dis = FRS_bound_max_dis
+                        first_risk_v = FRS_bound_max_v
+                                             
                     for i, danger_zone in enumerate(danger_zone_list):
                         
                         if not FRS.disjoint(danger_zone):
                             results_list[i] = False
                     
-                    if self.debug and True in results_list:
+                    if self.debug:# and True in results_list:
                         print(results_list)
                         for zone in danger_zone_list:
                             plt.plot(*zone.exterior.xy)
@@ -674,6 +814,7 @@ class StateChecker():
                             plt.plot(*FRS.xy, '--')
                         else:
                             plt.plot(*FRS.exterior.xy, '--')
+                        plt.title('815')
                         plt.show()
 
             
@@ -689,18 +830,34 @@ class StateChecker():
                     p_rel = cur_lane.delta_s_from_end(shadow_ds)+processed_ds
                     FRS = self.shadow_manager.bwd_shadow_FRS(shadow, t_sense, t_check)
                     if FRS is None:
-                        #print(shadow.root.id, shadow.root.ds_out, shadow.leaf_depth, "FRS is None")
                         continue
                     FRS = translate_polygon(FRS, -p_rel)
+                    if isinstance(FRS, LineString):
+                        FRS_bound = FRS.xy
+                    else:
+                        FRS_bound = FRS.exterior.xy
+                    FRS_bound_max_dis = max(FRS_bound[0])
+                    FRS_bound_max_v = max(FRS_bound[1])
+                    if FRS_bound_max_dis > first_risk_dis:
+                        first_risk_dis = FRS_bound_max_dis
+                        first_risk_v = FRS_bound_max_v
                                            
                     for i, danger_zone in enumerate(danger_zone_list):
                         if not FRS.disjoint(danger_zone):
                             results_list[i] = False
-                        # if self.debug:
-                        #     plt.plot(*danger_zone.exterior.xy)
-                    # if self.debug:
-                    #     plt.plot(*FRS.exterior.xy, '*')
-                    #     plt.show()
+                
+                if self.debug:
+                    if isinstance(FRS, LineString):
+                        plt.plot(*FRS.xy, '--')
+                    else:
+                        plt.plot(*FRS.exterior.xy, '--')
+
+                if self.debug:# and True in results_list:
+                    for zone in danger_zone_list:
+                        plt.plot(*zone.exterior.xy, '-')
+                    plt.title('855')
+                    plt.show()
+                       
                         
                     
             processed_ds += cur_lane.length
@@ -708,32 +865,41 @@ class StateChecker():
                 for predecessor in cur_lane.predecessor:
                     lane_queue.put((predecessor, processed_ds))
 
-        return results_list
+        return results_list, first_risk_v
 
     def _plan_close_loop_lane_change(self, lanelet_id_check, lanelet_id_target, ds_check, direction_check, p_check, v_check, l_check, vl_check, lateral_dir,
                                                             dl_enter, dl_shield, dl_finish, t_sense, t_check,
                                                             obstacle_predictor, shadow_map_sense, use_record, plan_step = 0.1 ):
 
-        delta_t = t_check - t_sense
+        delta_t = min(t_check - t_sense, 0.5)
         obstacle_map_sense, occupied_lanelet_sense = obstacle_predictor(t_sense, use_record)        
-        gap_list = self._find_lane_change_gaps(lanelet_id_target, ds_check, t_sense, t_check, obstacle_predictor, occupied_lanelet_sense,shadow_map_sense, use_record)
+        gap_list, obs_ds = self._find_lane_change_gaps(lanelet_id_target, ds_check, t_sense, t_check, obstacle_predictor, occupied_lanelet_sense,shadow_map_sense, use_record)
         
         # HACK end
-        
+        """ make sure not ego did not run into the FRS of the object it want to overtake"""
+        if dl_enter<0.2 and obs_ds[0] is not None:
+                       
+            obs_front = obs_ds[0]+self.ego_length/2
+            obs_end = obs_ds[1] - self.ego_length/2
+            if self.debug:
+                print("!!! check if the car run into obstacle", obs_front, obs_end)     
+            if obs_front>=0 and obs_end<=0:
+                return False, None, None, None, None, False
+       
 
-        dt_finish = np.sqrt(4*dl_finish/self.a_max)
+        dt_finish = np.sqrt(4*dl_finish/self.a_max_decel)
         if dl_shield < dl_finish/2:
-            dt_shield = np.sqrt(2*dl_shield/self.a_max)
+            dt_shield = np.sqrt(2*dl_shield/self.a_max_decel)
             dt_finish = 2*dt_shield
         else:
-            dt_shield = dt_finish - np.sqrt(2*(dl_finish-dl_shield)/self.a_max)
+            dt_shield = dt_finish - np.sqrt(2*(dl_finish-dl_shield)/self.a_max_decel)
         
         if dl_enter < 0:
             dt_enter = 0
         elif dl_enter< dl_finish/2:
-            dt_enter = np.sqrt(4*dl_enter/self.a_max)
+            dt_enter = np.sqrt(4*dl_enter/self.a_max_decel)
         else: # dl_shield>dl_enter>1/2dl_finish
-            dt_enter = dt_finish - np.sqrt(2*(dl_finish-dl_enter)/self.a_max)
+            dt_enter = dt_finish - np.sqrt(2*(dl_finish-dl_enter)/self.a_max_decel)
 
         if self.debug:
             print("in _plan_close_loop_lane_change move from {} to {}".format(lanelet_id_check, lanelet_id_target))
@@ -751,19 +917,26 @@ class StateChecker():
 
         """check each gap"""
         find_safe_gap = False
-        fastest_t_shield = np.inf
+        fastest_t_shield = 1000
         action = None
+        can_replan = False
+        s_max_enforce = None
+        s_max_not_enforce = []
         for gap in gap_list:
-            t_start_lane_change, t_shield, v_shield, dp_shield = self._lane_change_to_gap(v_check, gap, dt_enter, dt_shield, dt_finish)
+            if dl_enter<0:
+                if np.sign(gap[0]) == np.sign(gap[3]):
+                    continue
+            t_start_lane_change, t_shield, v_shield, dp_shield = self._lane_change_to_gap(v_check, gap, dl_enter, dt_enter, dt_shield, dt_finish, lanelet_id_target, ds_check)
             if self.debug:
                 print("t_start_lane_change={}, t_shield={}, v_shield={}, dp_shield={}".format(t_start_lane_change, t_shield, v_shield, dp_shield))
             if t_start_lane_change is None:
                 continue
             
-            danger_zone = lane_change_dangerzone(dp_shield, t_shield, self.a_max, self.v_max, self.ego_length/2)
+            danger_zone, s_same_max, s_oppo_max = lane_change_dangerzone(dp_shield, t_shield, self.a_max_accel, self.a_max_decel, self.v_max, self.ego_length/2)
             if self.debug:
                 plt.plot(*danger_zone.exterior.xy)
             ok_to_lane_change = True
+            incoming_threat = False
             if direction_check:
                 if object_list is not None:
                     obstacle, v_frenet, dp_obj = object_list # at time sense
@@ -776,17 +949,28 @@ class StateChecker():
                         print("outgoing obstacle at ", dp_obj, v_frenet)
                     if not danger_zone.disjoint(FRS):
                         ok_to_lane_change  = False
+
                 if shadow_list is not None:
                     _, dp_rel = shadow_list
                     if self.debug:
                         print("outgoing shadow at ", dp_rel)
                     if dp_rel < dp_shield:
                         ok_to_lane_change  = False
+
+                if s_max_enforce is None:
+                    s_max_enforce = s_same_max
+                elif s_same_max < s_max_enforce:
+                    s_max_not_enforce.append(s_max_enforce)
+                    s_max_enforce = s_same_max
+                else:
+                    s_max_not_enforce.append(s_same_max)
+
             else:
                 for obj in object_list:
                     obstacle, v_frenet, dp_obj = obj # at time sense
+                    FRS = translate_polygon(obstacle.calc_FRS(v_frenet, delta_t,True), dp_obj)
+                    incoming_threat = True
                     if self.debug:
-                        FRS = translate_polygon(obstacle.calc_FRS(v_frenet, delta_t,True), dp_obj)
                         if isinstance(FRS, Polygon):
                             plt.plot(*FRS.exterior.xy)
                         else:
@@ -795,38 +979,84 @@ class StateChecker():
                     if not danger_zone.disjoint(FRS):
                         ok_to_lane_change  = False
                         break
-                if ok_to_lane_change:
-                    for shadow_tuple in shadow_list:
-                        shadow, dp_shadow = shadow_tuple
-                        FRS = self.shadow_manager.bwd_shadow_FRS(shadow, t_sense, t_check, oppo=True)
-                        
-                        FRS = translate_polygon(FRS, dp_shadow)
-                        if self.debug:
-                            if isinstance(FRS, Polygon):
-                                plt.plot(*FRS.exterior.xy)
-                            else:
-                                plt.plot(*FRS.xy)
-                            print("incoming shadow at ", dp_shadow)
-                        if FRS is None:
-                            continue
-                        if not danger_zone.disjoint(FRS):
-                            ok_to_lane_change  = False
-                            break
-            if self.debug:
-                plt.show()
-            if ok_to_lane_change:
-                    find_safe_gap = True
-                    if t_shield<fastest_t_shield:
-                        # determine action
-                        if t_check<t_start_lane_change:
-                            # full acceleration/deceleration
-                            action = (np.sign(v_shield - v_check)*self.a_max, 0)
+                
+                for shadow_tuple in shadow_list:
+                    shadow, dp_shadow = shadow_tuple
+                    FRS = self.shadow_manager.bwd_shadow_FRS(shadow, t_sense, t_check, oppo=True)
+                    FRS = translate_polygon(FRS, dp_shadow)
+                    if self.debug:
+                        if isinstance(FRS, Polygon):
+                            plt.plot(*FRS.exterior.xy)
                         else:
-                            lateral_stop = vl_check**2/(2*self.a_max)
-                            if lateral_stop<dl_finish:
-                                action = (0, self.a_max)
-                            else:
-                                action = (0, -self.a_max)
+                            plt.plot(*FRS.xy)
+                    if FRS is None:
+                        continue
+                    if not danger_zone.disjoint(FRS):
+                        ok_to_lane_change  = False
+                        break
+                
+                if s_max_enforce is None:
+                    s_max_enforce = s_oppo_max
+                elif s_oppo_max < s_max_enforce:
+                    s_max_not_enforce.append(s_max_enforce)
+                    s_max_enforce = s_oppo_max
+                else:
+                    s_max_not_enforce.append(s_oppo_max)
+            if self.debug:
+                plt.title("1009")
+                plt.show()
+
+            if ok_to_lane_change:
+                if self.debug:
+                    print("gap")
+                find_safe_gap = True
+                can_replan = not incoming_threat
+                if t_shield<fastest_t_shield:
+                    # determine action
+                    if t_start_lane_change>0:
+                        # full acceleration/deceleration
+                        if vl_check != 0:
+                            a_lat = -np.sign(vl_check)*min(self.a_max_decel, np.abs(vl_check)/plan_step)
+                        else:
+                            a_lat = 0
+                        a_lon_max=  np.sqrt(self.a_max_decel**2 - a_lat**2)
+                        if v_shield>v_check:
+                            action = (min(self.a_max_accel, a_lon_max), a_lat)
+                        else:
+                            action = (-a_lon_max, a_lat)
+                    elif incoming_threat:
+                        a_lat = self.a_max_decel*lateral_dir
+                        vl_plan = vl_check+a_lat*plan_step
+                        lateral_stop = vl_plan**2/(2*self.a_max_decel) + vl_plan*plan_step+0.5*a_lat*plan_step**2
+                        if lateral_stop<dl_finish:
+                            action = (0, a_lat)
+                        else:
+                            action = (0, -a_lat)
+                    else: 
+                        a_lon = (v_shield - v_check)/plan_step
+                        if a_lon>0:
+                            action = (min(self.a_max_accel, a_lon), 0)
+                        else:
+                            action = (max(-self.a_max_accel, a_lon), 0)
+
+        if self.debug:
+            print("Evasive action:", action, v_shield, v_check, t_check, t_start_lane_change)
+
+        """ draw danger zone"""
+        if self.record_danger_zone and s_max_enforce is not None:
+            cur_danger_zone_plot = DangerZonePlot()
+            cur_danger_zone_plot.search(lanelet_id_check, ds_check, s_max_enforce,direction_check, True, None, self.road_network, self.route)
+            self.dangerzone_list.append(cur_danger_zone_plot)
+
+            # for s_max in s_max_not_enforce:
+            #     cur_danger_zone_plot = DangerZonePlot()
+            #     cur_danger_zone_plot.search(lanelet_id_check, ds_check, s_max, direction_check, False, None, self.road_network, self.route)
+            #     self.dangerzone_list.append(cur_danger_zone_plot)
+
+                
+
+        
+
         
 
         if action is not None:
@@ -835,10 +1065,10 @@ class StateChecker():
                 t_2_max = (self.v_max - v_check)/action[0]
                 p_plan = p_check + v_check*t_2_max + 0.5*action[0]*t_2_max**2+self.v_max*(plan_step - t_2_max)
                 v_plan = self.v_max
-            elif v_plan<0 and action[0]!=0:
-                t_2_stop = v_check/action[0]
-                p_plan = p_check + v_check*t_2_stop + 0.5*action[0]*t_2_stop**2
-                v_plan = 0
+            elif v_plan<self.v_min and action[0]!=0:
+                t_2_min = (v_check-self.v_min)/action[0]
+                p_plan = p_check + v_check*t_2_min + 0.5*action[0]*t_2_min**2
+                v_plan = self.v_min
             else:
                 p_plan = p_check + v_check*plan_step + 0.5*action[0]*plan_step**2
             
@@ -848,20 +1078,21 @@ class StateChecker():
         else: 
             p_plan=l_plan=v_plan=vl_plan = None
            
-        return find_safe_gap, p_plan, l_plan, v_plan, vl_plan, False
+        return find_safe_gap, p_plan, l_plan, v_plan, vl_plan, can_replan
                         
-    def _lane_change_to_gap(self, v_check, gap, dt_enter, dt_shield, dt_finish):
+    def _lane_change_to_gap(self, v_check, gap, dl_enter, dt_enter, dt_shield, dt_finish, lanelet_id_target, ds_check):
         dp_front, v_front, _, dp_back, v_back, _ = gap
         delta_p_front = dp_front - self.ego_length/2
         delta_p_back = dp_back + self.ego_length/2
 
         if self.debug:
+            print("")
             print("In gap ", gap, "to the front of gap", delta_p_front, "to the end of gap", delta_p_back)
 
         if dp_front - dp_back <= self.ego_length:
             if self.debug:
                 print("gap too tight")
-                return None, None, None, None
+            return None, None, None, None
 
         """ determine when the ego is going to be parallel with the gap """
         if delta_p_back>0:
@@ -886,7 +1117,8 @@ class StateChecker():
         if self.debug:
             print("t_catch_up={}, v_catch_up={}, dp_catch_up={}".format(t_catch_up, v_catch_up, dp_catch_up))
         """ After being parallel with the gap, determine when is safe to do lateral motion"""
-        t_start_lane_change, v_start_lane_change, dp_start_lane_change = self._lane_change_in(t_catch_up, v_catch_up, dp_catch_up, gap, dt_enter, dt_finish)
+        t_start_lane_change, v_start_lane_change, dp_start_lane_change = self._lane_change_match(t_catch_up, v_catch_up, dp_catch_up,
+                                                                     gap, dl_enter, dt_enter, dt_finish, lanelet_id_target, ds_check)
 
         """ Calculate when and wher the ego vehicle will completely shild in the target gap"""
         if t_start_lane_change is not None:
@@ -901,40 +1133,39 @@ class StateChecker():
 
     def _catch_up_accel(self, delta_p_back, v_check, v_bound_back):
         # Full acceleration to catch up to back bound of gap
-        a = 0.5*self.a_max
+        a = 0.5*self.a_max_accel
         b = v_check - v_bound_back
         c = -delta_p_back # < 0
         omega = np.sqrt(b**2-4*a*c)
         t_catch_up = (-b+omega)/(2*a)
-        v_catch_up = v_check+t_catch_up*self.a_max
-        p_catch_up = v_check*t_catch_up+0.5*self.a_max*t_catch_up**2
+        v_catch_up = v_check+t_catch_up*self.a_max_accel
+        p_catch_up = v_check*t_catch_up+0.5*self.a_max_accel*t_catch_up**2
         if v_catch_up > self.v_max:
-            t_to_max = (self.v_max - v_check)/self.a_max
-            delta_p_2 = delta_p_back+v_bound_back*t_to_max - v_check*t_to_max - 0.5*self.a_max*t_to_max**2
+            t_to_max = (self.v_max - v_check)/self.a_max_accel
+            delta_p_2 = delta_p_back+v_bound_back*t_to_max - v_check*t_to_max - 0.5*self.a_max_accel*t_to_max**2
             t_catch_up = t_to_max + delta_p_2/(self.v_max - v_bound_back)
             v_catch_up = self.v_max
-            p_catch_up = v_check*t_to_max+0.5*self.a_max*t_to_max**2+v_catch_up*(t_catch_up - t_to_max)
+            p_catch_up = v_check*t_to_max+0.5*self.a_max_accel*t_to_max**2+v_catch_up*(t_catch_up - t_to_max)
         return t_catch_up, v_catch_up, p_catch_up
     
     def _catch_up_decel(self, delta_p_front, v_check, v_bound_front):
         # Full deceleration to catch up to back bound of gap
-        a = -0.5*self.a_max
+        a = -0.5*self.a_max_decel
         b = v_check - v_bound_front
         c = -delta_p_front # > 0
         omega = np.sqrt(b**2-4*a*c)
-        t_catch_up = (-b+omega)/(2*a)
-        v_catch_up = v_check+t_catch_up*self.a_max
-        p_catch_up = v_check*t_catch_up+0.5*self.a_max*t_catch_up**2
-        v_min = 2
-        if v_catch_up < v_min:
-            t_to_min = (v_check-v_min)/self.a_max
-            delta_p_2 = delta_p_front+v_bound_front*t_to_min - v_check*t_to_min + 0.5*self.a_max*t_to_min**2
-            t_catch_up = t_to_min + delta_p_2/(v_min - v_bound_front)
-            v_catch_up = v_min
-            p_catch_up = v_check*t_to_min-0.5*self.a_max*t_to_min**2+v_catch_up*(t_catch_up - t_to_min)
+        t_catch_up = (-b-omega)/(2*a) # check here
+        v_catch_up = v_check-t_catch_up*self.a_max_decel
+        p_catch_up = v_check*t_catch_up-0.5*self.a_max_decel*t_catch_up**2
+        if v_catch_up < self.v_min:
+            t_to_min = (v_check-self.v_min)/self.a_max_decel
+            delta_p_2 = delta_p_front+v_bound_front*t_to_min - v_check*t_to_min + 0.5*self.a_max_decel*t_to_min**2
+            t_catch_up = t_to_min + delta_p_2/(self.v_min - v_bound_front)
+            v_catch_up = self.v_min
+            p_catch_up = v_check*t_to_min-0.5*self.a_max_decel*t_to_min**2+v_catch_up*(t_catch_up - t_to_min)
         return t_catch_up, v_catch_up, p_catch_up
 
-    def _lane_change_in(self, t_catch_up, v_catch_up, dp_catch_up, gap, dt_enter, dt_finish):
+    def _lane_change_match(self, t_catch_up, v_catch_up, dp_catch_up, gap, dl_enter, dt_enter, dt_finish, lanelet_id_target, ds_check):
         dt_response = 0.5
         delta_p_front, v_front, a_front, dp_back, v_back, a_back = gap
         """ ASSUMPTION: vehicle in target lane will keep constant velocity until the ego vehicle enter the target lane"""
@@ -947,60 +1178,110 @@ class StateChecker():
 
         # distance to the back boundary of gap. Vehicle should be ahead this bound
         delta_p_back_catch_up = dp_back+v_back*t_catch_up - dp_catch_up + self.ego_length/2 # this value should <=0
-        delta_p_back_enter = delta_p_back_catch_up+ dt_enter*(v_back - v_catch_up)
+        delta_p_back_enter = np.round(delta_p_back_catch_up+ dt_enter*(v_back - v_catch_up),4)
 
         # the vehicle in the front brake at the time of entering, but the ego cannot respond until finish lane change
-        danger_zone_front = max(0, v_catch_up**2/(2*self.a_max)+(dt_finish-dt_enter)*v_catch_up - v_front**2/(2*a_front))
-        danger_zone_back = max(0, v_back*dt_response + v_back**2/(2*a_back) - v_catch_up**2/(2*self.a_max))
+        danger_zone_front = max(0, v_catch_up**2/(2*self.a_max_decel)+(dt_finish-dt_enter)*v_catch_up - v_front**2/(2*a_front))
+        danger_zone_back = max(0, v_back*dt_response + v_back**2/(2*a_back) - v_catch_up**2/(2*self.a_max_decel))
         if self.debug:
             print("delta_p_front_enter ={}, delta_p_back_enter = {}, danger_zone_front= {}, danger_zone_back={}".format(delta_p_front_enter, delta_p_back_enter, danger_zone_front, danger_zone_back))
 
-        v_min = 2
+
+        if delta_p_front_enter < danger_zone_front and (-delta_p_back_enter) < danger_zone_back:
+            if self.debug:
+                print("gap is too tight")
+            return None, None, None
+
+        if dl_enter<0:
+            if self.record_danger_zone and dl_enter<-0.1:
+                cur_danger_zone_back = DangerZonePlot()
+                cur_danger_zone_back.search(lanelet_id_target, ds_check, danger_zone_back, False, True, None, self.road_network, self.route)
+                self.dangerzone_list.append(cur_danger_zone_back)
+
+                cur_danger_zone_front = DangerZonePlot()
+                cur_danger_zone_front.search(lanelet_id_target, ds_check, danger_zone_front, True, True, None, self.road_network, self.route)
+                self.dangerzone_list.append(cur_danger_zone_front)
+
+            if delta_p_front_enter < danger_zone_front or (-delta_p_back_enter) < danger_zone_back:
+                if self.record_danger_zone:
+                    RuntimeWarning("delta_p_front_enter={}, danger_zone_front={}, delta_p_back_enter={}, danger_zone_back={}".format(delta_p_front_enter, danger_zone_front, delta_p_back_enter, danger_zone_back))
+                    return t_catch_up, v_catch_up, dp_catch_up
+                if self.debug:
+                    print("partially in the lane, no way to be safe")
+                return None, None, None
+
         if delta_p_front_enter >= danger_zone_front and (-delta_p_back_enter) >= danger_zone_back:
             dt_lat_start = t_catch_up
             v_lat_start = v_catch_up
             dp_lat_start = dp_catch_up
-        elif delta_p_front_enter < danger_zone_front and (-delta_p_back_enter) < danger_zone_back:
-            if self.debug:
-                print("gap is too tight")
-            return None, None, None
         elif delta_p_front_enter < danger_zone_front:
-            if v_front <= v_min:
+            if v_front <= self.v_min:
                 if self.debug:
                     print("No way to slow down v_front: ",v_front)
-                return None, None, None
-            num = v_catch_up**2/(2*self.a_max) - v_front**2/(2*a_front) - delta_p_front_catch_up + v_catch_up*dt_finish - v_front*dt_enter
-            det = v_front + self.a_max*dt_finish
+                return  None, None, None
+            num = v_catch_up**2/(2*self.a_max_decel) - v_front**2/(2*a_front) - delta_p_front_catch_up + v_catch_up*dt_finish - v_front*dt_enter
+            det = v_front + self.a_max_decel*dt_finish
             dt_exceed = num/det
-            v_exceed = v_catch_up - self.a_max*dt_exceed
-            dp_exceed = v_catch_up*dt_exceed - 0.5*self.a_max*dt_exceed**2
-            if v_exceed<v_min:
-                t_to_min = (v_catch_up - v_min)/self.a_max
-                p_to_min = v_catch_up*t_to_min - 0.5*self.a_max*t_to_min**2
-                lane_change_safe_distance = v_min**2/(2*self.a_max) - v_front**2/(2*a_front)
-                dis_remain = lane_change_safe_distance + p_to_min - delta_p_front_catch_up - v_front*(t_to_min+dt_enter) +v_min*dt_finish
-                dt_exceed = t_to_min + dis_remain / (v_front - v_min)
-                v_exceed = v_min
-                dp_exceed = p_to_min + v_min*dt_exceed
+            v_exceed = v_catch_up - self.a_max_decel*dt_exceed
+            dp_exceed = v_catch_up*dt_exceed - 0.5*self.a_max_decel*dt_exceed**2
+            if v_exceed<self.v_min:
+                t_to_min = (v_catch_up - self.v_min)/self.a_max_decel
+                p_to_min = v_catch_up*t_to_min - 0.5*self.a_max_decel*t_to_min**2
+                lane_change_safe_distance = self.v_min**2/(2*self.a_max_decel) - v_front**2/(2*a_front)
+                dis_remain = lane_change_safe_distance + p_to_min - delta_p_front_catch_up - v_front*(t_to_min+dt_enter) +self.v_min*dt_finish
+                dt_exceed = t_to_min + dis_remain / (v_front - self.v_min)
+                v_exceed = self.v_min
+                dp_exceed = p_to_min + self.v_min*(dt_exceed-t_to_min)
             dt_lat_start = t_catch_up+dt_exceed
             v_lat_start = v_exceed
-            dp_lat_start = dp_catch_up+dp_exceed            
+            dp_lat_start = dp_catch_up+dp_exceed   
+
+            # now check if collision is also avoided at enter
+            delta_p_front_lat_start = delta_p_front + v_front*dt_lat_start - dp_lat_start - self.ego_length/2
+            delta_p_front_enter = np.round(delta_p_front_lat_start+dt_enter*(v_front - v_lat_start),4)
+            if delta_p_front_enter<0: # and dt_enter>0:
+                #print("delta_p_front_enter, ",delta_p_front_enter, delta_p_front, v_front, v_catch_up, dt_enter, dt_finish)
+                
+                a = -0.5*self.a_max_decel
+                b = v_catch_up-v_front-self.a_max_decel*dt_enter
+                c = (v_catch_up-v_front)*dt_enter - delta_p_front_catch_up
+                omega = np.sqrt(b**2-4*a*c) 
+                dt_exceed = (-b-omega)/(2*a)
+                v_exceed = v_catch_up - self.a_max_decel*dt_exceed
+                dp_exceed = v_catch_up*dt_exceed - 0.5*self.a_max_decel*dt_exceed**2
+                if v_exceed<self.v_min:
+                    t_to_min = (v_catch_up - self.v_min)/self.a_max_decel
+                    p_to_min = v_catch_up*t_to_min - 0.5*self.a_max_decel*t_to_min**2
+                    dis_remain = p_to_min+self.v_min*dt_enter-(t_to_min+dt_enter)*v_front-delta_p_front_catch_up
+                    dt_exceed = t_to_min + dis_remain / (v_front - self.v_min)
+                    v_exceed = self.v_min
+                    dp_exceed = p_to_min + self.v_min*(dt_exceed-t_to_min)
+                dt_lat_start = t_catch_up+dt_exceed
+                v_lat_start = v_exceed
+                dp_lat_start = dp_catch_up+dp_exceed
+
+                # # do some sanity check
+                # delta_p_front_lat_start = delta_p_front + v_front*dt_lat_start - dp_lat_start - self.ego_length/2
+                # delta_p_front_enter = np.round(delta_p_front_lat_start+dt_enter*(v_front - v_lat_start),4)
+                # danger_zone_front = np.round(max(0, v_lat_start**2/(2*self.a_max_decel)+(dt_finish-dt_enter)*v_lat_start - v_front**2/(2*a_front)), 4)
+                # if delta_p_front_enter < danger_zone_front:
+                #     raise RuntimeError("sanity check fail Old value:",(dt_lat_start_old, v_lat_start_old, dp_lat_start_old), "new:", (dt_lat_start, v_lat_start, dp_lat_start))
         else:
             if v_back>=self.v_max:
                 if self.debug:
                     print("No way to speed up v_back: ",v_back)
                 return None, None, None
-            a = self.a_max
-            b = 2*v_catch_up+self.a_max*dt_enter - v_back
-            c = v_catch_up*dt_enter - delta_p_back_catch_up + v_catch_up**2/(2*self.a_max) - v_back**2/(2*a_back) - v_back*dt_response
+            a = self.a_max_accel
+            b = 2*v_catch_up+self.a_max_accel*dt_enter - v_back
+            c = v_catch_up*dt_enter - delta_p_back_catch_up + v_catch_up**2/(2*self.a_max_decel) - v_back**2/(2*a_back) - v_back*dt_response
             omega = np.sqrt(b**2-4*a*c) 
             dt_exceed = (-b+omega)/(2*a)
-            v_exceed = v_catch_up+dt_exceed*self.a_max
-            dp_exceed = v_catch_up*dt_exceed+0.5*self.a_max*dt_exceed**2
+            v_exceed = v_catch_up+dt_exceed*self.a_max_accel
+            dp_exceed = v_catch_up*dt_exceed+0.5*self.a_max_accel*dt_exceed**2
             if v_exceed > self.v_max:
-                t_to_max = (self.v_max - v_catch_up)/self.a_max
-                p_to_max = v_catch_up*t_to_max + 0.5*self.a_max*t_to_max**2
-                lane_change_safe_distance = v_back*dt_response + v_back**2/(2*a_back) - self.v_max**2/(2*self.a_max)
+                t_to_max = (self.v_max - v_catch_up)/self.a_max_accel
+                p_to_max = v_catch_up*t_to_max + 0.5*self.a_max_accel*t_to_max**2
+                lane_change_safe_distance = v_back*dt_response + v_back**2/(2*a_back) - self.v_max**2/(2*self.a_max_decel)
                 dis_remain =  lane_change_safe_distance + v_back*t_to_max + delta_p_back_catch_up - p_to_max + (v_back - self.v_max)*dt_enter
                 dt_exceed = t_to_max + dis_remain/(self.v_max - v_back)
                 v_exceed = self.v_max
@@ -1014,13 +1295,13 @@ class StateChecker():
         """ based on the time of lateral start, check if the ego can be safe at time of enter"""
 
 
-        delta_p_frondt_lat_start = delta_p_front + v_front*dt_lat_start - dp_lat_start - self.ego_length/2
-        delta_p_front_enter = delta_p_frondt_lat_start+dt_enter*(v_front - v_lat_start)
+        delta_p_front_lat_start = delta_p_front + v_front*dt_lat_start - dp_lat_start - self.ego_length/2
+        delta_p_front_enter = np.round(delta_p_front_lat_start+dt_enter*(v_front - v_lat_start),4)
         delta_p_back_lat_start = dp_back+v_back*dt_lat_start - dp_lat_start + self.ego_length/2 # this value should <=0
-        delta_p_back_enter = delta_p_back_lat_start+ dt_enter*(v_back - v_lat_start)
+        delta_p_back_enter = np.round(delta_p_back_lat_start+ dt_enter*(v_back - v_lat_start), 4)
 
-        danger_zone_front = max(0, v_lat_start**2/(2*self.a_max)+(dt_finish-dt_enter)*v_catch_up - v_front**2/(2*a_front))
-        danger_zone_back = max(0, v_back*dt_response + v_back**2/(2*a_back) - v_lat_start**2/(2*self.a_max))
+        danger_zone_front = np.round(max(0, v_lat_start**2/(2*self.a_max_decel)+(dt_finish-dt_enter)*v_lat_start - v_front**2/(2*a_front)), 4)
+        danger_zone_back = np.round(max(0, v_back*dt_response + v_back**2/(2*a_back) - v_lat_start**2/(2*self.a_max_decel)),4)
 
 
         if self.debug:
@@ -1028,11 +1309,14 @@ class StateChecker():
 
         if delta_p_front_enter < danger_zone_front or (-delta_p_back_enter) < danger_zone_back:
             if self.debug:
+                print("delta_p_front_enter={}, danger_zone_front={}, delta_p_back_enter={}, danger_zone_back={}".format(delta_p_front_enter, danger_zone_front, delta_p_back_enter, danger_zone_back))
                 print("After speed mathc, too tight, Not safe")
+                input("wait!")
             return None, None, None
         else:
             return dt_lat_start, v_lat_start, dp_lat_start
-                 
+
+           
     def _find_lane_change_gaps(self, lanelet_id_target, ds_check, t_sense, t_check,  obstacle_predictor, occupied_lanelet_sense, shadow_map_sense, use_record):
 
         #HACK 
@@ -1040,11 +1324,11 @@ class StateChecker():
         # TODO:
         # find all gaps that the vehicle may lane_change in
         delta_t = t_check - t_sense
+        delta_t_obs = min(delta_t, 0.5)
         #_, occupied_lanelet_sense = obstacle_predictor(t_sense, use_record)
         obstacle_map_check, _ = obstacle_predictor(t_check, use_record)
 
         """ explore forward"""
-        self.search_stop = 3*self.v_max**2/(2*self.a_max)
         cur_lane = self.road_network.find_lane_id(lanelet_id_target)
         cur_lanelet_id = lanelet_id_target
         p_covered = -cur_lane.delta_s_from_begin(ds_check) 
@@ -1064,8 +1348,8 @@ class StateChecker():
                     sorted_obj = heapq.nlargest(len(cur_obj_queue), cur_obj_queue)
                 for obs_ds, v_frenet, obstacle in sorted_obj:
                     p_rel = cur_lane.delta_s_from_begin(obs_ds)+p_covered
-                    if self.debug:
-                        print("Found object on target lane", p_rel, obs_ds, v_frenet)
+                    # if self.debug:
+                    #     print("Found object on target lane", p_rel, obs_ds, v_frenet)
                     if obstacle_cloest is None:
                         obstacle_cloest = (p_rel, v_frenet, obstacle)
                     elif abs(p_rel)<abs(obstacle_cloest[0]):
@@ -1123,20 +1407,22 @@ class StateChecker():
                     break
 
         """ form gaps"""
+        obs_ds = []
         gap_list = []
         if obstacle_cloest is None:
-            gap_list.append((np.inf, 0 , self.a_max, -np.inf, self.v_max, self.a_max))
+            gap_list.append((200, 0 , self.a_max_decel, -200, self.v_max, self.a_max_decel))
+            obs_ds = [None, None]
         else:
             """ add the gap ahead of cloest obstacle"""
-            p_front = np.inf
+            p_front = 200
             v_front = 0
-            a_front = self.a_max
+            a_front = self.a_max_decel
             p_rel_closest, v_closest, obstacle_closest = obstacle_cloest
 
             v_back = v_closest
-            a_back = obstacle_closest.a_max
+            a_back = obstacle_closest.a_max_decel
             # HACK assume constant veloity
-            p_back = p_rel_closest + obstacle_closest.bbox.ext_x  +  self.slack_distance
+            p_back = p_rel_closest + obstacle_closest.bbox.ext_x  +  self.slack_distance*3
             #p_back = p_rel_closest + a_back*delta_t+ 0.5*a_back*delta_t**2+obstacle_closest.bbox.ext_x+self.slack_distance
             if obstacle_ahead is None:
                 # HACK ignore the merge case
@@ -1155,39 +1441,37 @@ class StateChecker():
                             sorted_shadow = heapq.nlargest(len(cur_shadow_queue), cur_shadow_queue)
 
                         for shadow_ds, shadow in sorted_shadow:
-                            if self.debug:
-                                print("find shadow in ", shadow.root.id)
+                            # if self.debug:
+                            #     print("find shadow in ", shadow.root.id)
                             # TODO how about shadow merge into the current lane
                             p_shadow_start = cur_lane.delta_s_from_begin(shadow_ds)+p_covered
                             if None in shadow.leaf_depth:
-                                p_shadow_end = np.inf
+                                p_shadow_end = self.search_stop
                                 v_shadow = self.v_max
                             else:
                                 shadow_depth = 0
                                 v_shadow = 0
-                                for in_bound, depth in zip(shadow.leaf_list, shadow.leaf_depth):
-                                    if self.route.in_ego_path(in_bound.id):
+                                for out_bound, depth in zip(shadow.leaf_list, shadow.leaf_depth):
+                                    if self.route.in_ego_path(out_bound.id):
                                         shadow_depth = depth
                                         if depth >(3+self.slack_distance):
-                                            if self.debug:
-                                                print(in_bound.t_in_hist, in_bound.t_in)
-                                            v_shadow = max(v_back, self.shadow_manager.calc_V_max(in_bound, depth-3-self.slack_distance, t_sense))
+                                            v_shadow = max(v_back, self.shadow_manager.calc_V_max(shadow.root, depth-3-self.slack_distance, t_sense))
                                         else:
                                             v_shadow = v_back
                                         break
                                 p_shadow_end = p_shadow_start+shadow_depth+v_shadow*delta_t
 
-                            if self.debug:
-                                print("starts at", shadow_ds, p_shadow_start, p_shadow_end, v_shadow, shadow.leaf_depth, p_back)
+                            # if self.debug:
+                            #     print("starts at", shadow_ds, p_shadow_start, p_shadow_end, v_shadow, shadow.leaf_depth, p_back)
 
                             if p_shadow_end < p_back:
                                 continue
                             elif p_shadow_start>p_back:
                                 p_front = p_shadow_start
-                                a_front = self.a_max
+                                a_front = self.a_max_decel
                                 v_front = 0
                                 found_shadow = True
-                            elif p_shadow_end == np.inf:
+                            elif p_shadow_end >= self.search_stop:
                                 # the object drive into the shadow
                                 p_front = p_back
                                 a_front = a_back
@@ -1196,7 +1480,7 @@ class StateChecker():
                             else:
                                 # there is a shadow in the front of cloest object
                                 p_back = p_shadow_end
-                                a_back = self.a_max
+                                a_back = self.a_max_decel
                                 v_back = v_shadow
                                 
                     p_covered += cur_lane.length
@@ -1209,29 +1493,30 @@ class StateChecker():
 
             else:
                 p_rel_front, v_front, obstacle_front = obstacle_ahead
-                a_front = obstacle_front.a_max
+                a_front = obstacle_front.a_max_decel
                 p_front = p_rel_front-obstacle_front.bbox.ext_x-self.slack_distance
 
-            
+            obs_ds.append(p_back)
             gap_list.append((p_front, v_front, a_front, p_back, v_back, a_back))
 
             """ add the gap behind the cloest obstacle"""
             p_rel_front, v_front, obstacle_front = obstacle_cloest
-            a_front = obstacle_front.a_max
-            p_front = p_rel_front - 0.5*a_front*delta_t**2-obstacle_front.bbox.ext_x-self.slack_distance
+            a_front = obstacle_front.a_max_decel
+            p_front = p_rel_front - 0.5*a_front*delta_t_obs**2-obstacle_front.bbox.ext_x-self.slack_distance
             
             if obstacle_behind is None:
-                p_back = -np.inf
+                p_back = -self.search_stop
                 v_back = self.v_max
-                a_back = self.a_max
+                a_back = self.a_max_decel
             else:
                 p_rel_back, v_back, obstacle_back = obstacle_behind
-                a_back = obstacle_back.a_max
-                p_back = p_rel_back + 0.5*a_back*delta_t**2+obstacle_front.bbox.ext_x+self.slack_distance
+                a_back = obstacle_back.a_max_decel
+                p_back = p_rel_back + 0.5*a_back*delta_t_obs**2+obstacle_front.bbox.ext_x+self.slack_distance
             
+            obs_ds.append(p_front)
             gap_list.append((p_front, v_front, a_front, p_back, v_back, a_back))
 
-        return gap_list
+        return gap_list, obs_ds
             
     @staticmethod
     def time2finish(v0, a, dis, v_max):
@@ -1263,34 +1548,34 @@ class StateChecker():
                 v_terminal = v_max
         return t, v_terminal
 
-    def _max_accel(self, v_ego, v_obs, a_max_obs, s_remain, plan_step):
-        if a_max_obs == 0:
-            s_obs_stop = s_remain
-        else:
-            s_obs_stop = v_obs**2/(2*a_max_obs) + s_remain
+    # def _max_accel(self, v_ego, v_obs, a_max_obs, s_remain, plan_step):
+    #     if a_max_obs == 0:
+    #         s_obs_stop = s_remain
+    #     else:
+    #         s_obs_stop = v_obs**2/(2*a_max_obs) + s_remain
 
-        a = plan_step**2/(2*self.a_max)
-        b = v_ego*plan_step/self.a_max+0.5*plan_step**2
-        c = v_ego**2/(2*self.a_max)+v_ego*plan_step-s_obs_stop
+    #     a = plan_step**2/(2*self.a_max)
+    #     b = v_ego*plan_step/self.a_max+0.5*plan_step**2
+    #     c = v_ego**2/(2*self.a_max)+v_ego*plan_step-s_obs_stop
 
-        if (b**2-4*a*c)<0 and self.debug:
-            print("Warning, ", v_ego, v_obs, a_max_obs, s_remain)
-        omega = np.sqrt(b**2-4*a*c)
-        return (-b+omega)/(2*a)
+    #     if (b**2-4*a*c)<0 and self.debug:
+    #         print("Warning, ", v_ego, v_obs, a_max_obs, s_remain)
+    #     omega = np.sqrt(b**2-4*a*c)
+    #     return (-b+omega)/(2*a)
 
-    @staticmethod
-    def _min_decelerate(v_ego, v_obs, a_max_obs, p_rel):
-        """
-            Assume the vehicle ahead apply the maximum deceleration
-            what is the minimum decelerate the ego vehicle need to apply to stop before collision
-            p_rel is the relative distance between the fron of ego to the rear of the object
-        """
-        if v_ego == 0:
-            return 0
-        s_obs_stop = v_obs**2/(2*a_max_obs)
-        s_ego_stop = s_obs_stop+p_rel-3
-        a_ego_require = v_ego**2/(2*s_ego_stop)
-        return -a_ego_require
+    # @staticmethod
+    # def _min_decelerate(v_ego, v_obs, a_max_obs, p_rel):
+    #     """
+    #         Assume the vehicle ahead apply the maximum deceleration
+    #         what is the minimum decelerate the ego vehicle need to apply to stop before collision
+    #         p_rel is the relative distance between the fron of ego to the rear of the object
+    #     """
+    #     if v_ego == 0:
+    #         return 0
+    #     s_obs_stop = v_obs**2/(2*a_max_obs)
+    #     s_ego_stop = s_obs_stop+p_rel-3
+    #     a_ego_require = v_ego**2/(2*s_ego_stop)
+    #     return -a_ego_require
 
     def debug_plot(self, lanelet_id, ds):
 
