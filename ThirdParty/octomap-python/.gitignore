@@ -6,5 +6,5 @@
 
 /*.so
 
-/src/
-!/src/octomap
+#/src/
+#!/src/octomap
